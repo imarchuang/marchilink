@@ -14,7 +14,7 @@ type HTTPServer struct {
 func (s HTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("marchilink slice 2\n"))
+		_, _ = w.Write([]byte("marchilink\n\nGET /healthz\nGET /jobs/demo/watermarks\nGET /jobs/demo/state\n"))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -23,6 +23,10 @@ func (s HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("/jobs/demo/watermarks", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(s.Graph.Watermarks())
+	})
+	mux.HandleFunc("/jobs/demo/state", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.Graph.State())
 	})
 	return mux
 }

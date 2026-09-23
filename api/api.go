@@ -16,8 +16,9 @@ type Job struct {
 	keyBy  runtime.KeyFunc
 	sink   runtime.Sink
 
-	assigner runtime.WindowAssigner
-	agg      runtime.AggFactory
+	processFn runtime.ProcessFunc
+	assigner  runtime.WindowAssigner
+	agg       runtime.AggFactory
 
 	parallelism     int
 	channelCapacity int
@@ -89,12 +90,22 @@ func (j *Job) Window(assigner runtime.WindowAssigner, agg runtime.AggFactory) *J
 	return j
 }
 
+// Process sets a stateful flat-map operator running after keyBy. State
+// accessed through the StateContext is scoped to the key of each event.
+func (j *Job) Process(fn runtime.ProcessFunc) *Job {
+	j.processFn = fn
+	return j
+}
+
 // Graph builds the runtime graph for the job.
 func (j *Job) Graph() *runtime.Graph {
 	graph := runtime.NewGraph(j.source, j.mapFn, j.keyBy, j.sink)
 	graph.SetParallelism(j.parallelism)
 	graph.SetChannelCapacity(j.channelCapacity)
 	graph.SetWatermarkBound(j.watermarkBound)
+	if j.processFn != nil {
+		graph.SetProcess(j.processFn)
+	}
 	if j.assigner != nil {
 		graph.SetWindow(j.assigner, j.agg)
 	}

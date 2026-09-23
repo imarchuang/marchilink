@@ -16,6 +16,7 @@ import (
 
 func main() {
 	var (
+		jobName     = flag.String("job", "windowed-count", "demo job: windowed-count | dedup | running-count")
 		count       = flag.Int("count", 10, "number of events to generate")
 		interval    = flag.Duration("interval", 100*time.Millisecond, "delay between generated events")
 		parallelism = flag.Int("parallelism", 2, "number of downstream subtasks")
@@ -37,29 +38,42 @@ func main() {
 		if i%5 == 4 {
 			ts = ts.Add(-(*interval))
 		}
-		events = append(events, runtime.Event{
+		event := runtime.Event{
 			Key:       fmt.Sprintf("key-%d", i%4),
 			Value:     fmt.Sprintf("event-%d", i),
 			Timestamp: ts,
-		})
+		}
+		if *jobName == "dedup" && i%7 == 6 && i > 0 {
+			// Inject duplicates: resend the previous (key, order id) pair.
+			event.Key = events[i-1].Key
+			event.Value = events[i-1].Value
+		}
+		events = append(events, event)
 	}
 
-	var assigner runtime.WindowAssigner
-	if *windowSlide > 0 {
-		assigner = runtime.Sliding(*windowSize, *windowSlide)
-	} else {
-		assigner = runtime.Tumbling(*windowSize)
-	}
-
-	job := api.NewJob("slice3-windows").
+	job := api.NewJob(*jobName).
 		Source(runtime.ScriptedSource{Events: events}).
 		Map(api.UppercaseValue).
 		KeyBy(func(event runtime.Event) string { return event.Key }).
-		Window(assigner, runtime.Count()).
 		Parallelism(*parallelism).
 		ChannelCapacity(*buffer).
 		WatermarkBound(*wmBound).
 		Sink(runtime.StdoutSink{Writer: os.Stdout})
+
+	switch *jobName {
+	case "dedup":
+		job.Process(dedup)
+	case "running-count":
+		job.Process(runningCount)
+	default: // windowed-count
+		var assigner runtime.WindowAssigner
+		if *windowSlide > 0 {
+			assigner = runtime.Sliding(*windowSize, *windowSlide)
+		} else {
+			assigner = runtime.Tumbling(*windowSize)
+		}
+		job.Window(assigner, runtime.Count())
+	}
 
 	graph := job.Graph()
 	server := &http.Server{Addr: *httpAddr, Handler: runtime.HTTPServer{Graph: graph}.Handler()}
@@ -81,4 +95,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, "marchilink:", err)
 		os.Exit(1)
 	}
+}
+
+// dedup filters events whose (key, order id) was already seen, using MapState.
+func dedup(ctx *runtime.StateContext, event runtime.Event) ([]runtime.Event, error) {
+	seen := runtime.MapOf[string, bool](ctx, "seen-orders")
+	if _, ok := seen.Get(event.Value); ok {
+		return nil, nil
+	}
+	seen.Put(event.Value, true)
+	return []runtime.Event{event}, nil
+}
+
+// runningCount maintains a per-key counter in ValueState and annotates events.
+func runningCount(ctx *runtime.StateContext, event runtime.Event) ([]runtime.Event, error) {
+	count := runtime.ValueOf[int64](ctx, "running-count")
+	n, _ := count.Get()
+	n++
+	count.Set(n)
+	event.Value = fmt.Sprintf("%s count=%d", event.Value, n)
+	return []runtime.Event{event}, nil
 }
