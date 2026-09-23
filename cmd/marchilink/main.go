@@ -21,6 +21,8 @@ func main() {
 		parallelism = flag.Int("parallelism", 2, "number of downstream subtasks")
 		buffer      = flag.Int("buffer", 4, "bounded channel capacity per edge")
 		wmBound     = flag.Duration("watermark-bound", 2*time.Second, "bounded out-of-orderness for watermarks")
+		windowSize  = flag.Duration("window", 5*time.Second, "window size")
+		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
 	)
 	flag.Parse()
@@ -42,10 +44,18 @@ func main() {
 		})
 	}
 
-	job := api.NewJob("slice2-watermarks").
+	var assigner runtime.WindowAssigner
+	if *windowSlide > 0 {
+		assigner = runtime.Sliding(*windowSize, *windowSlide)
+	} else {
+		assigner = runtime.Tumbling(*windowSize)
+	}
+
+	job := api.NewJob("slice3-windows").
 		Source(runtime.ScriptedSource{Events: events}).
 		Map(api.UppercaseValue).
 		KeyBy(func(event runtime.Event) string { return event.Key }).
+		Window(assigner, runtime.Count()).
 		Parallelism(*parallelism).
 		ChannelCapacity(*buffer).
 		WatermarkBound(*wmBound).

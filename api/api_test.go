@@ -29,6 +29,31 @@ func TestJobRun(t *testing.T) {
 	}
 }
 
+func TestJobRunWindowed(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+	job := NewJob("windowed-job").
+		Source(runtime.ScriptedSource{Events: []runtime.Event{
+			{Key: "a", Value: "1", Timestamp: base.Add(1 * time.Second)},
+			{Key: "a", Value: "2", Timestamp: base.Add(3 * time.Second)},
+		}}).
+		Map(UppercaseValue).
+		KeyBy(func(event runtime.Event) string { return event.Key }).
+		Window(runtime.Tumbling(10*time.Second), runtime.Count()).
+		Sink(runtime.StdoutSink{Writer: &out})
+
+	if err := job.Run(context.Background()); err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "window[") || !strings.Contains(got, " 2") {
+		t.Fatalf("expected a fired window with count 2, got %q", got)
+	}
+}
+
 func TestJobGraphExposesWatermarks(t *testing.T) {
 	t.Parallel()
 
