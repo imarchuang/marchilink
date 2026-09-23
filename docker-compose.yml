@@ -1,0 +1,4 @@
+services:
+  marchilink:
+    build: .
+    command: ["-count", "10", "-interval", "100ms"]
