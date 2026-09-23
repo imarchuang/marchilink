@@ -28,3 +28,27 @@ func TestJobRun(t *testing.T) {
 		t.Fatalf("unexpected output: %q", got)
 	}
 }
+
+func TestJobGraphExposesWatermarks(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	job := NewJob("wm-job").
+		Source(runtime.ScriptedSource{Events: []runtime.Event{
+			{Key: "a", Value: "1", Timestamp: base.Add(3 * time.Second)},
+			{Key: "a", Value: "2", Timestamp: base.Add(5 * time.Second)},
+		}}).
+		Map(UppercaseValue).
+		KeyBy(func(event runtime.Event) string { return event.Key }).
+		WatermarkBound(time.Second).
+		Sink(runtime.StdoutSink{Writer: &bytes.Buffer{}})
+
+	graph := job.Graph()
+	if err := graph.Run(context.Background()); err != nil {
+		t.Fatalf("run graph: %v", err)
+	}
+
+	if got := graph.Watermarks().Source; !got.Equal(base.Add(4 * time.Second)) {
+		t.Fatalf("unexpected source watermark: %s", got)
+	}
+}

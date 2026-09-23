@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/imarchuang/marchilink/runtime"
 )
@@ -17,11 +18,12 @@ type Job struct {
 
 	parallelism     int
 	channelCapacity int
+	watermarkBound  time.Duration
 }
 
 // NewJob creates a named job.
 func NewJob(name string) *Job {
-	return &Job{name: name, parallelism: 1, channelCapacity: 16}
+	return &Job{name: name, parallelism: 1, channelCapacity: 16, watermarkBound: 5 * time.Second}
 }
 
 // Name returns the job name.
@@ -69,12 +71,26 @@ func (j *Job) ChannelCapacity(capacity int) *Job {
 	return j
 }
 
-// Run executes the job graph.
-func (j *Job) Run(ctx context.Context) error {
+// WatermarkBound sets bounded out-of-orderness for event time.
+func (j *Job) WatermarkBound(bound time.Duration) *Job {
+	if bound >= 0 {
+		j.watermarkBound = bound
+	}
+	return j
+}
+
+// Graph builds the runtime graph for the job.
+func (j *Job) Graph() *runtime.Graph {
 	graph := runtime.NewGraph(j.source, j.mapFn, j.keyBy, j.sink)
 	graph.SetParallelism(j.parallelism)
 	graph.SetChannelCapacity(j.channelCapacity)
-	return graph.Run(ctx)
+	graph.SetWatermarkBound(j.watermarkBound)
+	return graph
+}
+
+// Run executes the job graph.
+func (j *Job) Run(ctx context.Context) error {
+	return j.Graph().Run(ctx)
 }
 
 // UppercaseValue is a tiny demo mapper for slice 0.
