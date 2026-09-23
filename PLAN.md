@@ -337,7 +337,7 @@ marchilink/
   runtime/*_test.go
 ```
 
-Module path: `github.com/marchi/marchilink` (mirror marchiq). Go 1.22, zero
+Module path: `github.com/imarchuang/marchilink` (mirror marchiq). Go 1.22, zero
 third-party dependencies.
 
 ---
