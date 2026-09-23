@@ -6,27 +6,37 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const defaultChannelCapacity = 16
 
+// finalWatermark flushes all remaining windows when a bounded source ends.
+// It is never fed into any tracker; it only triggers a final fire.
+var finalWatermark = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
 // KeyFunc extracts the partitioning key from an event.
 type KeyFunc func(Event) string
 
-// WatermarkSnapshot reports watermark progress for the graph.
+// WatermarkSnapshot reports watermark and window progress for the graph.
 type WatermarkSnapshot struct {
-	Source time.Time   `json:"source"`
-	Sink   []time.Time `json:"sink"`
-	Min    time.Time   `json:"min"`
+	Source         time.Time   `json:"source"`
+	Subtasks       []time.Time `json:"subtasks"`
+	Min            time.Time   `json:"min"`
+	LateRecords    int64       `json:"lateRecords"`
+	PendingWindows int64       `json:"pendingWindows"`
 }
 
-// Graph is a minimal in-process DAG for slice 1.
+// Graph is a minimal in-process DAG: source -> map -> keyBy -> window -> sink.
 type Graph struct {
 	source Source
 	mapFn  MapFunc
 	keyBy  KeyFunc
 	sink   Sink
+
+	assigner WindowAssigner
+	agg      AggFactory
 
 	parallelism     int
 	channelCapacity int
@@ -34,7 +44,26 @@ type Graph struct {
 
 	mu       sync.RWMutex
 	sourceWM *WatermarkTracker
-	sinkWM   *WatermarkTracker
+	subs     []*windowSubtask
+}
+
+// windowSubtask is one parallel instance of the window operator: its own
+// event-time clock plus its own slice of keyed window state.
+type windowSubtask struct {
+	tracker *WatermarkTracker
+	states  map[string]map[Window]Aggregator
+	pending atomic.Int64
+	late    atomic.Int64
+}
+
+// streamMsg is what flows through a channel: either a data record or a
+// watermark control record (broadcast to every subtask).
+type streamMsg struct {
+	event Event
+	key   string
+	wm    time.Time
+	isWM  bool
+	final bool
 }
 
 // NewGraph builds a source -> map -> keyBy -> sink graph.
@@ -50,7 +79,7 @@ func NewGraph(source Source, mapFn MapFunc, keyBy KeyFunc, sink Sink) *Graph {
 	}
 }
 
-// SetParallelism configures the number of downstream subtasks after keyBy.
+// SetParallelism configures the number of window subtasks after keyBy.
 func (g *Graph) SetParallelism(parallelism int) {
 	if parallelism > 0 {
 		g.parallelism = parallelism
@@ -71,7 +100,14 @@ func (g *Graph) SetWatermarkBound(bound time.Duration) {
 	}
 }
 
-// Watermarks returns the current watermark snapshot.
+// SetWindow enables the window operator. Without it, subtasks pass events
+// straight through to the sink.
+func (g *Graph) SetWindow(assigner WindowAssigner, agg AggFactory) {
+	g.assigner = assigner
+	g.agg = agg
+}
+
+// Watermarks returns the current watermark/window snapshot.
 func (g *Graph) Watermarks() WatermarkSnapshot {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -80,10 +116,14 @@ func (g *Graph) Watermarks() WatermarkSnapshot {
 	if g.sourceWM != nil {
 		snapshot.Source = g.sourceWM.Current()
 	}
-	if g.sinkWM != nil {
-		snapshot.Min = g.sinkWM.Current()
-		snapshot.Sink = make([]time.Time, len(g.sinkWM.inputs))
-		copy(snapshot.Sink, g.sinkWM.inputs)
+	for _, st := range g.subs {
+		clock := st.tracker.Current()
+		snapshot.Subtasks = append(snapshot.Subtasks, clock)
+		if snapshot.Min.IsZero() || (!clock.IsZero() && clock.Before(snapshot.Min)) {
+			snapshot.Min = clock
+		}
+		snapshot.LateRecords += st.late.Load()
+		snapshot.PendingWindows += st.pending.Load()
 	}
 	return snapshot
 }
@@ -102,36 +142,49 @@ func (g *Graph) Run(ctx context.Context) error {
 	if g.sink == nil {
 		return errors.New("graph sink is nil")
 	}
-
-	type keyedEvent struct {
-		event Event
-		key   string
-		wm    time.Time
+	if (g.assigner == nil) != (g.agg == nil) {
+		return errors.New("window assigner and aggregator must be set together")
 	}
 
-	channels := make([]chan keyedEvent, g.parallelism)
-	for i := range channels {
-		channels[i] = make(chan keyedEvent, g.channelCapacity)
+	subChs := make([]chan streamMsg, g.parallelism)
+	subs := make([]*windowSubtask, g.parallelism)
+	for i := range subChs {
+		subChs[i] = make(chan streamMsg, g.channelCapacity)
+		subs[i] = &windowSubtask{
+			tracker: NewWatermarkTracker(1, 0),
+			states:  make(map[string]map[Window]Aggregator),
+		}
 	}
+	sinkCh := make(chan Event, g.channelCapacity)
 
 	g.mu.Lock()
 	g.sourceWM = NewWatermarkTracker(1, g.watermarkBound)
-	g.sinkWM = NewWatermarkTracker(g.parallelism, 0)
+	g.subs = subs
 	g.mu.Unlock()
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, g.parallelism+1)
-
-	for i := 0; i < g.parallelism; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			for item := range channels[idx] {
-				g.sinkWM.UpdateInput(idx, item.wm)
-				if err := g.sink.Write(ctx, item.event); err != nil {
-					errCh <- fmt.Errorf("sink subtask %d: %w", idx, err)
-					return
+	// Single sink goroutine; drains even after an error so subtasks never
+	// block on a dead sink.
+	sinkDone := make(chan error, 1)
+	go func() {
+		var sinkErr error
+		for event := range sinkCh {
+			if sinkErr == nil {
+				if err := g.sink.Write(ctx, event); err != nil {
+					sinkErr = err
 				}
+			}
+		}
+		sinkDone <- sinkErr
+	}()
+
+	var subWG sync.WaitGroup
+	subErrs := make(chan error, g.parallelism)
+	for i := 0; i < g.parallelism; i++ {
+		subWG.Add(1)
+		go func(idx int) {
+			defer subWG.Done()
+			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh); err != nil {
+				subErrs <- fmt.Errorf("window subtask %d: %w", idx, err)
 			}
 		}(i)
 	}
@@ -140,29 +193,134 @@ func (g *Graph) Run(ctx context.Context) error {
 		mapped := g.mapFn(event)
 		key := g.keyBy(mapped)
 		idx := routeKey(key, g.parallelism)
-		wm := g.sourceWM.ObserveEvent(mapped.Timestamp)
+		wm, advanced := g.sourceWM.ObserveEvent(mapped.Timestamp)
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case channels[idx] <- keyedEvent{event: mapped, key: key, wm: wm}:
-			return nil
+		if err := sendMsg(ctx, subChs[idx], streamMsg{event: mapped, key: key}); err != nil {
+			return err
 		}
+
+		// Watermark advanced: broadcast it to every subtask, like Flink
+		// broadcasts watermark control records on all output channels.
+		if advanced {
+			for _, ch := range subChs {
+				if err := sendMsg(ctx, ch, streamMsg{isWM: true, wm: wm}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 
-	for _, ch := range channels {
+	if sourceErr == nil {
+		// Bounded source ended: flush every remaining window.
+		for _, ch := range subChs {
+			if err := sendMsg(ctx, ch, streamMsg{isWM: true, final: true, wm: finalWatermark}); err != nil {
+				sourceErr = err
+				break
+			}
+		}
+	}
+
+	for _, ch := range subChs {
 		close(ch)
 	}
-	wg.Wait()
+	subWG.Wait()
+	close(sinkCh)
+	sinkErr := <-sinkDone
 
 	if sourceErr != nil {
 		return sourceErr
 	}
-
 	select {
-	case err := <-errCh:
+	case err := <-subErrs:
 		return err
 	default:
+	}
+	return sinkErr
+}
+
+// runSubtask is the loop of one window subtask: data records update keyed
+// window state, watermark records advance the subtask's own clock and fire
+// due windows.
+func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh chan<- Event) error {
+	for m := range in {
+		switch {
+		case m.isWM && m.final:
+			if err := g.fireWhere(ctx, st, sinkCh, func(Window) bool { return true }); err != nil {
+				return err
+			}
+		case m.isWM:
+			clock := st.tracker.UpdateInput(0, m.wm)
+			if err := g.fireWhere(ctx, st, sinkCh, func(w Window) bool { return !clock.Before(w.End) }); err != nil {
+				return err
+			}
+		default:
+			if g.assigner == nil {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case sinkCh <- m.event:
+				}
+				continue
+			}
+
+			clock := st.tracker.Current()
+			for _, w := range g.assigner.Assign(m.event.Timestamp) {
+				if !w.End.After(clock) {
+					// The window already fired: this record is late.
+					st.late.Add(1)
+					continue
+				}
+				byWindow := st.states[m.key]
+				if byWindow == nil {
+					byWindow = make(map[Window]Aggregator)
+					st.states[m.key] = byWindow
+				}
+				agg, ok := byWindow[w]
+				if !ok {
+					agg = g.agg()
+					byWindow[w] = agg
+					st.pending.Add(1)
+				}
+				agg.Add(m.event)
+			}
+		}
+	}
+	return nil
+}
+
+// fireWhere emits and deletes every window matching pred.
+func (g *Graph) fireWhere(ctx context.Context, st *windowSubtask, sinkCh chan<- Event, pred func(Window) bool) error {
+	for key, byWindow := range st.states {
+		for w, agg := range byWindow {
+			if !pred(w) {
+				continue
+			}
+			result := Event{
+				Key:       key,
+				Value:     fmt.Sprintf("window[%s~%s) %s", w.Start.Format("15:04:05"), w.End.Format("15:04:05"), agg.Result()),
+				Timestamp: w.End,
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case sinkCh <- result:
+			}
+			delete(byWindow, w)
+			st.pending.Add(-1)
+		}
+		if len(byWindow) == 0 {
+			delete(st.states, key)
+		}
+	}
+	return nil
+}
+
+func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case ch <- m:
 		return nil
 	}
 }

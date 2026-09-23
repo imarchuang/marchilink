@@ -16,6 +16,9 @@ type Job struct {
 	keyBy  runtime.KeyFunc
 	sink   runtime.Sink
 
+	assigner runtime.WindowAssigner
+	agg      runtime.AggFactory
+
 	parallelism     int
 	channelCapacity int
 	watermarkBound  time.Duration
@@ -79,12 +82,22 @@ func (j *Job) WatermarkBound(bound time.Duration) *Job {
 	return j
 }
 
+// Window sets the event-time window assigner and aggregator.
+func (j *Job) Window(assigner runtime.WindowAssigner, agg runtime.AggFactory) *Job {
+	j.assigner = assigner
+	j.agg = agg
+	return j
+}
+
 // Graph builds the runtime graph for the job.
 func (j *Job) Graph() *runtime.Graph {
 	graph := runtime.NewGraph(j.source, j.mapFn, j.keyBy, j.sink)
 	graph.SetParallelism(j.parallelism)
 	graph.SetChannelCapacity(j.channelCapacity)
 	graph.SetWatermarkBound(j.watermarkBound)
+	if j.assigner != nil {
+		graph.SetWindow(j.assigner, j.agg)
+	}
 	return graph
 }
 

@@ -28,8 +28,9 @@ func NewWatermarkTracker(inputCount int, bound time.Duration) *WatermarkTracker 
 	}
 }
 
-// ObserveEvent records an event timestamp and returns the source watermark.
-func (t *WatermarkTracker) ObserveEvent(ts time.Time) time.Time {
+// ObserveEvent records an event timestamp and returns the source watermark
+// plus whether it advanced.
+func (t *WatermarkTracker) ObserveEvent(ts time.Time) (time.Time, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -41,8 +42,9 @@ func (t *WatermarkTracker) ObserveEvent(ts time.Time) time.Time {
 	wm := t.seenMax.Add(-t.bound)
 	if wm.After(t.current) {
 		t.current = wm
+		return t.current, true
 	}
-	return t.current
+	return t.current, false
 }
 
 // UpdateInput records a watermark from one input and returns the operator watermark.
