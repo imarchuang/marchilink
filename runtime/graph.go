@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"time"
 )
 
 const defaultChannelCapacity = 16
 
 // KeyFunc extracts the partitioning key from an event.
 type KeyFunc func(Event) string
+
+// WatermarkSnapshot reports watermark progress for the graph.
+type WatermarkSnapshot struct {
+	Source time.Time   `json:"source"`
+	Sink   []time.Time `json:"sink"`
+	Min    time.Time   `json:"min"`
+}
 
 // Graph is a minimal in-process DAG for slice 1.
 type Graph struct {
@@ -22,6 +30,11 @@ type Graph struct {
 
 	parallelism     int
 	channelCapacity int
+	watermarkBound  time.Duration
+
+	mu       sync.RWMutex
+	sourceWM *WatermarkTracker
+	sinkWM   *WatermarkTracker
 }
 
 // NewGraph builds a source -> map -> keyBy -> sink graph.
@@ -33,6 +46,7 @@ func NewGraph(source Source, mapFn MapFunc, keyBy KeyFunc, sink Sink) *Graph {
 		sink:            sink,
 		parallelism:     1,
 		channelCapacity: defaultChannelCapacity,
+		watermarkBound:  5 * time.Second,
 	}
 }
 
@@ -48,6 +62,30 @@ func (g *Graph) SetChannelCapacity(capacity int) {
 	if capacity > 0 {
 		g.channelCapacity = capacity
 	}
+}
+
+// SetWatermarkBound configures bounded out-of-orderness at the source.
+func (g *Graph) SetWatermarkBound(bound time.Duration) {
+	if bound >= 0 {
+		g.watermarkBound = bound
+	}
+}
+
+// Watermarks returns the current watermark snapshot.
+func (g *Graph) Watermarks() WatermarkSnapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	snapshot := WatermarkSnapshot{}
+	if g.sourceWM != nil {
+		snapshot.Source = g.sourceWM.Current()
+	}
+	if g.sinkWM != nil {
+		snapshot.Min = g.sinkWM.Current()
+		snapshot.Sink = make([]time.Time, len(g.sinkWM.inputs))
+		copy(snapshot.Sink, g.sinkWM.inputs)
+	}
+	return snapshot
 }
 
 // Run executes the graph.
@@ -68,12 +106,18 @@ func (g *Graph) Run(ctx context.Context) error {
 	type keyedEvent struct {
 		event Event
 		key   string
+		wm    time.Time
 	}
 
 	channels := make([]chan keyedEvent, g.parallelism)
 	for i := range channels {
 		channels[i] = make(chan keyedEvent, g.channelCapacity)
 	}
+
+	g.mu.Lock()
+	g.sourceWM = NewWatermarkTracker(1, g.watermarkBound)
+	g.sinkWM = NewWatermarkTracker(g.parallelism, 0)
+	g.mu.Unlock()
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, g.parallelism+1)
@@ -83,6 +127,7 @@ func (g *Graph) Run(ctx context.Context) error {
 		go func(idx int) {
 			defer wg.Done()
 			for item := range channels[idx] {
+				g.sinkWM.UpdateInput(idx, item.wm)
 				if err := g.sink.Write(ctx, item.event); err != nil {
 					errCh <- fmt.Errorf("sink subtask %d: %w", idx, err)
 					return
@@ -95,11 +140,12 @@ func (g *Graph) Run(ctx context.Context) error {
 		mapped := g.mapFn(event)
 		key := g.keyBy(mapped)
 		idx := routeKey(key, g.parallelism)
+		wm := g.sourceWM.ObserveEvent(mapped.Timestamp)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case channels[idx] <- keyedEvent{event: mapped, key: key}:
+		case channels[idx] <- keyedEvent{event: mapped, key: key, wm: wm}:
 			return nil
 		}
 	})
