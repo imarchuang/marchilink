@@ -17,6 +17,7 @@ func TestJobRun(t *testing.T) {
 	job := NewJob("test-job").
 		Source(runtime.GeneratorSource{Count: 2, Interval: time.Millisecond}).
 		Map(UppercaseValue).
+		KeyBy(func(event runtime.Event) string { return event.Key }).
 		Sink(runtime.StdoutSink{Writer: &out})
 
 	if err := job.Run(context.Background()); err != nil {
