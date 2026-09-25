@@ -27,6 +27,8 @@ type checkpointMeta struct {
 // fully processed (i.e. the next record index to read).
 type sourceState struct {
 	Offset int64 `json:"offset"`
+	// Offsets is the per-partition fetch position for marchiq sources.
+	Offsets map[int]int64 `json:"offsets,omitempty"`
 }
 
 // subtaskSnapshot is one window/process subtask's full state.
