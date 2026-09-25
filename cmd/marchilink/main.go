@@ -25,6 +25,8 @@ func main() {
 		windowSize  = flag.Duration("window", 5*time.Second, "window size")
 		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
+		dataDir     = flag.String("data-dir", "", "checkpoint data directory (empty = no checkpointing)")
+		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = disabled)")
 	)
 	flag.Parse()
 
@@ -52,13 +54,17 @@ func main() {
 	}
 
 	job := api.NewJob(*jobName).
-		Source(runtime.ScriptedSource{Events: events}).
+		Source(&runtime.ScriptedSource{Events: events}).
 		Map(api.UppercaseValue).
 		KeyBy(func(event runtime.Event) string { return event.Key }).
 		Parallelism(*parallelism).
 		ChannelCapacity(*buffer).
 		WatermarkBound(*wmBound).
 		Sink(runtime.StdoutSink{Writer: os.Stdout})
+
+	if *dataDir != "" && *chkEvery > 0 {
+		job.Checkpointing(*dataDir, *chkEvery)
+	}
 
 	switch *jobName {
 	case "dedup":

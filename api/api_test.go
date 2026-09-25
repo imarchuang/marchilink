@@ -35,7 +35,7 @@ func TestJobRunWindowed(t *testing.T) {
 	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
 	var out bytes.Buffer
 	job := NewJob("windowed-job").
-		Source(runtime.ScriptedSource{Events: []runtime.Event{
+		Source(&runtime.ScriptedSource{Events: []runtime.Event{
 			{Key: "a", Value: "1", Timestamp: base.Add(1 * time.Second)},
 			{Key: "a", Value: "2", Timestamp: base.Add(3 * time.Second)},
 		}}).
@@ -59,7 +59,7 @@ func TestJobGraphExposesWatermarks(t *testing.T) {
 
 	base := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	job := NewJob("wm-job").
-		Source(runtime.ScriptedSource{Events: []runtime.Event{
+		Source(&runtime.ScriptedSource{Events: []runtime.Event{
 			{Key: "a", Value: "1", Timestamp: base.Add(3 * time.Second)},
 			{Key: "a", Value: "2", Timestamp: base.Add(5 * time.Second)},
 		}}).

@@ -76,6 +76,10 @@ func (a slidingAssigner) Assign(ts time.Time) []Window {
 type Aggregator interface {
 	Add(event Event)
 	Result() string
+	// snapshotKind identifies the aggregator type for checkpoint restore.
+	snapshotKind() string
+	// restore sets the aggregator's value from a checkpointed Result string.
+	restore(value string) error
 }
 
 // AggFactory creates a fresh Aggregator per (key, window).
@@ -93,6 +97,17 @@ type countAggregator struct {
 func (a *countAggregator) Add(Event) { a.n++ }
 
 func (a *countAggregator) Result() string { return strconv.FormatInt(a.n, 10) }
+
+func (a *countAggregator) snapshotKind() string { return "count" }
+
+func (a *countAggregator) restore(value string) error {
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return err
+	}
+	a.n = n
+	return nil
+}
 
 // Sum sums events whose Value parses as a float; others add 0.
 func Sum() AggFactory {
@@ -112,4 +127,15 @@ func (a *sumAggregator) Add(event Event) {
 
 func (a *sumAggregator) Result() string {
 	return strconv.FormatFloat(a.v, 'f', -1, 64)
+}
+
+func (a *sumAggregator) snapshotKind() string { return "sum" }
+
+func (a *sumAggregator) restore(value string) error {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return err
+	}
+	a.v = f
+	return nil
 }

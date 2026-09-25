@@ -24,7 +24,7 @@ func TestTumblingWindowOutOfOrderInputExactResults(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
-	source := ScriptedSource{Events: []Event{
+	source := &ScriptedSource{Events: []Event{
 		windowTestEvent(base, "a", 1),
 		windowTestEvent(base, "a", 3),
 		windowTestEvent(base, "a", 12), // wm=10 -> fires [00,10) with count 2
@@ -100,7 +100,7 @@ func TestSlidingWindowEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
-	source := ScriptedSource{Events: []Event{
+	source := &ScriptedSource{Events: []Event{
 		windowTestEvent(base, "a", 7), // belongs to [00,10) and [05,15)
 	}}
 
@@ -132,7 +132,7 @@ func TestWindowsAreIsolatedPerKey(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
-	source := ScriptedSource{Events: []Event{
+	source := &ScriptedSource{Events: []Event{
 		windowTestEvent(base, "a", 1),
 		windowTestEvent(base, "b", 2),
 		windowTestEvent(base, "a", 3),
@@ -174,7 +174,7 @@ func TestWindowFiresOnlyWhenWatermarkPassesEnd(t *testing.T) {
 	// ts=9 lands in [00,10); wm becomes 7 -> window must NOT fire yet.
 	// ts=11 lands in [10,20); wm becomes 9 -> still not past end=10? 9 < 10, no.
 	// ts=12 lands in [10,20); wm becomes 10 -> fires [00,10).
-	source := ScriptedSource{Events: []Event{
+	source := &ScriptedSource{Events: []Event{
 		windowTestEvent(base, "a", 9),
 		windowTestEvent(base, "a", 11),
 		windowTestEvent(base, "a", 12),
