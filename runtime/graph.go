@@ -248,6 +248,15 @@ func (g *Graph) Run(ctx context.Context) error {
 		}
 	}
 
+	// For marchiq sources, restore per-partition offsets from checkpoint.
+	if g.checkpointEnabled {
+		if _, srcState, _, err := g.store.loadLatest(); err == nil && len(srcState.Offsets) > 0 {
+			if restorer, ok := g.source.(interface{ RestoreOffsets(map[int]int64) }); ok {
+				restorer.RestoreOffsets(srcState.Offsets)
+			}
+		}
+	}
+
 	// Single sink goroutine; drains even after an error so subtasks never
 	// block on a dead sink.
 	sinkDone := make(chan error, 1)
@@ -414,6 +423,12 @@ func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID
 			return
 		}
 
+		// For marchiq sources, snapshot per-partition offsets.
+		var srcOffsets map[int]int64
+		if om, ok := g.source.(interface{ OffsetMap() map[int]int64 }); ok {
+			srcOffsets = om.OffsetMap()
+		}
+
 		// Wait for every subtask to ack with its snapshot.
 		snaps := make([]subtaskSnapshot, g.parallelism)
 		acked := 0
@@ -438,9 +453,18 @@ func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID
 			Parallelism: g.parallelism,
 			Status:      "completed",
 		}
-		if err := g.store.write(meta, sourceState{Offset: srcOffset}, snaps); err != nil {
+		if err := g.store.write(meta, sourceState{Offset: srcOffset, Offsets: srcOffsets}, snaps); err != nil {
 			// Log and continue; a failed checkpoint must not kill the job.
 			continue
+		}
+
+		// Checkpoint completed: commit source offsets to marchiq.
+		if committer, ok := g.source.(interface{ CommitOffsets(context.Context) error }); ok {
+			if err := committer.CommitOffsets(ctx); err != nil {
+				// Log and continue; offsets will be re-committed on the next
+				// checkpoint or replayed on recovery.
+				_ = err
+			}
 		}
 
 		g.mu.Lock()
