@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,9 +49,17 @@ type Graph struct {
 	channelCapacity int
 	watermarkBound  time.Duration
 
+	// checkpointing
+	jobID             string
+	dataDir           string
+	checkpointEvery   time.Duration
+	checkpointEnabled bool
+
 	mu       sync.RWMutex
 	sourceWM *WatermarkTracker
 	subs     []*windowSubtask
+	store    *checkpointStore
+	history  []checkpointMeta
 }
 
 // windowSubtask is one parallel instance of the keyed operators: its own
@@ -65,14 +74,26 @@ type windowSubtask struct {
 	late    atomic.Int64
 }
 
-// streamMsg is what flows through a channel: either a data record or a
-// watermark control record (broadcast to every subtask).
+// streamMsg is what flows through a channel: a data record, a watermark
+// control record, or a checkpoint barrier (all broadcast to every subtask).
 type streamMsg struct {
 	event Event
 	key   string
 	wm    time.Time
 	isWM  bool
 	final bool
+
+	isBarrier   bool
+	barrierID   checkpointID
+	barrierSnap int64 // source offset carried by the barrier
+}
+
+// barrierAck is a subtask's acknowledgement that it snapshotted at a barrier.
+type barrierAck struct {
+	id           checkpointID
+	idx          int
+	snap         subtaskSnapshot
+	sourceOffset int64
 }
 
 // NewGraph builds a source -> map -> keyBy -> sink graph.
@@ -119,6 +140,26 @@ func (g *Graph) SetWindow(assigner WindowAssigner, agg AggFactory) {
 // SetProcess enables the stateful process operator between keyBy and window.
 func (g *Graph) SetProcess(fn ProcessFunc) {
 	g.processFn = fn
+}
+
+// SetCheckpointing enables periodic checkpoints under {dataDir}/checkpoints/{jobID}.
+func (g *Graph) SetCheckpointing(dataDir, jobID string, every time.Duration) {
+	if dataDir != "" && every > 0 {
+		g.dataDir = dataDir
+		g.jobID = jobID
+		g.checkpointEvery = every
+		g.checkpointEnabled = true
+		g.store = newCheckpointStore(dataDir, jobID)
+	}
+}
+
+// Checkpoints returns completed checkpoint metadata, oldest first.
+func (g *Graph) Checkpoints() []checkpointMeta {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]checkpointMeta, len(g.history))
+	copy(out, g.history)
+	return out
 }
 
 // Watermarks returns the current watermark/window snapshot.
@@ -196,6 +237,17 @@ func (g *Graph) Run(ctx context.Context) error {
 	g.subs = subs
 	g.mu.Unlock()
 
+	// Restore from the latest completed checkpoint, if any.
+	var startOffset int64
+	if g.checkpointEnabled {
+		if err := g.restoreLatest(subs); err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+		if off, ok := g.source.(interface{ Offset() int64 }); ok {
+			startOffset = off.Offset()
+		}
+	}
+
 	// Single sink goroutine; drains even after an error so subtasks never
 	// block on a dead sink.
 	sinkDone := make(chan error, 1)
@@ -211,18 +263,35 @@ func (g *Graph) Run(ctx context.Context) error {
 		sinkDone <- sinkErr
 	}()
 
+	ackCh := make(chan barrierAck, g.parallelism*4)
+
 	var subWG sync.WaitGroup
 	subErrs := make(chan error, g.parallelism)
 	for i := 0; i < g.parallelism; i++ {
 		subWG.Add(1)
 		go func(idx int) {
 			defer subWG.Done()
-			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh); err != nil {
+			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh, ackCh); err != nil {
 				subErrs <- fmt.Errorf("window subtask %d: %w", idx, err)
 			}
 		}(i)
 	}
 
+	// Checkpoint coordinator: periodically asks the source to inject a barrier.
+	// barrierReq carries the barrier id; the source replies on barrierInjected
+	// with the offset it snapshotted, so the coordinator knows the barrier is
+	// in the stream before waiting for acks.
+	barrierReq := make(chan checkpointID)
+	barrierInjected := make(chan int64) // source offset at barrier
+	coordDone := make(chan struct{})
+	sourceDone := make(chan struct{})
+	if g.checkpointEnabled {
+		go g.runCoordinator(ctx, barrierReq, barrierInjected, ackCh, coordDone, sourceDone)
+	} else {
+		close(coordDone)
+	}
+
+	var sourceOffset int64 = startOffset
 	sourceErr := g.source.Run(ctx, func(event Event) error {
 		mapped := g.mapFn(event)
 		key := g.keyBy(mapped)
@@ -232,6 +301,7 @@ func (g *Graph) Run(ctx context.Context) error {
 		if err := sendMsg(ctx, subChs[idx], streamMsg{event: mapped, key: key}); err != nil {
 			return err
 		}
+		sourceOffset++
 
 		// Watermark advanced: broadcast it to every subtask, like Flink
 		// broadcasts watermark control records on all output channels.
@@ -242,8 +312,27 @@ func (g *Graph) Run(ctx context.Context) error {
 				}
 			}
 		}
+
+		// If the coordinator asked for a barrier, inject it now: the barrier
+		// carries the offset of the NEXT record, i.e. all records before it
+		// have already been emitted.
+		select {
+		case id := <-barrierReq:
+			for _, ch := range subChs {
+				if err := sendMsg(ctx, ch, streamMsg{isBarrier: true, barrierID: id, barrierSnap: sourceOffset}); err != nil {
+					return err
+				}
+			}
+			select {
+			case barrierInjected <- sourceOffset:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		default:
+		}
 		return nil
 	})
+	close(sourceDone)
 
 	if sourceErr == nil {
 		// Bounded source ended: flush every remaining window.
@@ -262,6 +351,12 @@ func (g *Graph) Run(ctx context.Context) error {
 	close(sinkCh)
 	sinkErr := <-sinkDone
 
+	// Stop the coordinator.
+	if g.checkpointEnabled {
+		close(barrierReq)
+	}
+	<-coordDone
+
 	if sourceErr != nil {
 		return sourceErr
 	}
@@ -273,12 +368,158 @@ func (g *Graph) Run(ctx context.Context) error {
 	return sinkErr
 }
 
+// runCoordinator triggers a checkpoint every interval, waits for all subtask
+// acks, then atomically publishes the checkpoint.
+func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID, barrierInjected <-chan int64, ackCh <-chan barrierAck, done chan<- struct{}, sourceDone <-chan struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(g.checkpointEvery)
+	defer ticker.Stop()
+
+	var nextID checkpointID = 1
+	// If we restored from a checkpoint, continue numbering after it.
+	if meta, _, _, err := g.store.loadLatest(); err == nil {
+		nextID = meta.ID + 1
+	}
+
+	sourceEnded := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sourceDone:
+			sourceEnded = true
+		case <-ticker.C:
+		}
+		if sourceEnded {
+			return
+		}
+
+		id := nextID
+		started := time.Now()
+
+		// Ask the source to inject a barrier, then wait for it to confirm.
+		select {
+		case barrierReq <- id:
+		case <-ctx.Done():
+			return
+		case <-sourceDone:
+			return
+		}
+		var srcOffset int64
+		select {
+		case srcOffset = <-barrierInjected:
+		case <-ctx.Done():
+			return
+		case <-sourceDone:
+			return
+		}
+
+		// Wait for every subtask to ack with its snapshot.
+		snaps := make([]subtaskSnapshot, g.parallelism)
+		acked := 0
+		for acked < g.parallelism {
+			select {
+			case <-ctx.Done():
+				return
+			case ack := <-ackCh:
+				if ack.id != id {
+					continue
+				}
+				snaps[ack.idx] = ack.snap
+				acked++
+			}
+		}
+
+		meta := checkpointMeta{
+			ID:          id,
+			JobID:       g.jobID,
+			StartedAt:   started,
+			FinishedAt:  time.Now(),
+			Parallelism: g.parallelism,
+			Status:      "completed",
+		}
+		if err := g.store.write(meta, sourceState{Offset: srcOffset}, snaps); err != nil {
+			// Log and continue; a failed checkpoint must not kill the job.
+			continue
+		}
+
+		g.mu.Lock()
+		g.history = append(g.history, meta)
+		g.mu.Unlock()
+		nextID++
+	}
+}
+
+// restoreLatest loads the latest completed checkpoint into subtask state and
+// rewinds the source.
+func (g *Graph) restoreLatest(subs []*windowSubtask) error {
+	meta, src, snaps, err := g.store.loadLatest()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no checkpoint yet
+		}
+		return err
+	}
+	if int(meta.Parallelism) != g.parallelism {
+		return fmt.Errorf("checkpoint parallelism %d != job parallelism %d", meta.Parallelism, g.parallelism)
+	}
+
+	for i := range subs {
+		snap := snaps[i]
+		subs[i].tracker.Restore(snap.Clock)
+		subs[i].store.restore(snap.ProcessState)
+		subs[i].late.Store(snap.Late)
+		subs[i].pending.Store(snap.Pending)
+
+		states := make(map[string]map[Window]Aggregator)
+		for key, byWindow := range snap.WindowState {
+			wm := make(map[Window]Aggregator, len(byWindow))
+			for wk, as := range byWindow {
+				w, err := parseWindowKey(wk)
+				if err != nil {
+					return err
+				}
+				agg := g.agg()
+				if agg.snapshotKind() != as.Kind {
+					return fmt.Errorf("aggregator kind mismatch: %s vs %s", agg.snapshotKind(), as.Kind)
+				}
+				if err := agg.restore(as.Value); err != nil {
+					return err
+				}
+				wm[w] = agg
+			}
+			states[key] = wm
+		}
+		subs[i].states = states
+	}
+
+	// Rewind the source.
+	if seeker, ok := g.source.(interface{ Seek(offset int64) }); ok {
+		seeker.Seek(src.Offset)
+	}
+	return nil
+}
+
 // runSubtask is the loop of one window subtask: data records update keyed
 // window state, watermark records advance the subtask's own clock and fire
-// due windows.
-func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh chan<- Event) error {
+// due windows, barrier records trigger a state snapshot.
+func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh chan<- Event, ackCh chan<- barrierAck) error {
 	for m := range in {
 		switch {
+		case m.isBarrier:
+			// Barrier arrived on our (single) input: snapshot state now.
+			snap := subtaskSnapshot{
+				Clock:        st.tracker.Current(),
+				ProcessState: st.store.snapshot(),
+				WindowState:  snapshotWindowState(st.states),
+				Late:         st.late.Load(),
+				Pending:      st.pending.Load(),
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case ackCh <- barrierAck{id: m.barrierID, idx: subtaskIndex(g, st), snap: snap, sourceOffset: m.barrierSnap}:
+			}
 		case m.isWM && m.final:
 			if err := g.fireWhere(ctx, st, sinkCh, func(Window) bool { return true }); err != nil {
 				return err
@@ -369,6 +610,31 @@ func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {
 	case ch <- m:
 		return nil
 	}
+}
+
+// subtaskIndex finds a subtask's index by identity (used for barrier acks).
+func subtaskIndex(g *Graph, target *windowSubtask) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for i, st := range g.subs {
+		if st == target {
+			return i
+		}
+	}
+	return -1
+}
+
+// snapshotWindowState converts live window aggregators to a serializable form.
+func snapshotWindowState(states map[string]map[Window]Aggregator) map[string]map[string]aggState {
+	out := make(map[string]map[string]aggState, len(states))
+	for key, byWindow := range states {
+		wm := make(map[string]aggState, len(byWindow))
+		for w, agg := range byWindow {
+			wm[windowKey(w)] = aggState{Kind: agg.snapshotKind(), Value: agg.Result()}
+		}
+		out[key] = wm
+	}
+	return out
 }
 
 func routeKey(key string, parallelism int) int {

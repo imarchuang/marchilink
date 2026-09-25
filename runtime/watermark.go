@@ -82,3 +82,11 @@ func (t *WatermarkTracker) Current() time.Time {
 	defer t.mu.RUnlock()
 	return t.current
 }
+
+// Restore sets the clock from a checkpoint snapshot.
+func (t *WatermarkTracker) Restore(ts time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.current = ts
+	t.started = true
+}

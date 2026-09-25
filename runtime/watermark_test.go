@@ -10,7 +10,7 @@ func TestWatermarksAdvanceMonotonicallyWithBoundedOutOfOrderness(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
-	source := ScriptedSource{Events: []Event{
+	source := &ScriptedSource{Events: []Event{
 		{Key: "a", Value: "1", Timestamp: base.Add(1 * time.Second)},
 		{Key: "a", Value: "2", Timestamp: base.Add(4 * time.Second)},
 		{Key: "a", Value: "3", Timestamp: base.Add(3 * time.Second)},

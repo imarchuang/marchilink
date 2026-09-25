@@ -66,6 +66,47 @@ func (s *stateStore) keyCounts() map[string]int {
 	return out
 }
 
+// snapshot returns a deep, JSON-serializable copy of all cells.
+func (s *stateStore) snapshot() map[string]map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]map[string]any, len(s.cells))
+	for name, byKey := range s.cells {
+		cp := make(map[string]any, len(byKey))
+		for key, cell := range byKey {
+			switch c := cell.(type) {
+			case *valueCell:
+				nc := &valueCell{set: c.set}
+				if c.set {
+					nc.v = c.v
+				}
+				cp[key] = nc
+			case *listCell:
+				nc := &listCell{items: append([]any(nil), c.items...)}
+				cp[key] = nc
+			case *mapCell:
+				nc := &mapCell{m: make(map[any]any, len(c.m))}
+				for k, v := range c.m {
+					nc.m[k] = v
+				}
+				cp[key] = nc
+			}
+		}
+		out[name] = cp
+	}
+	return out
+}
+
+// restore replaces the store contents from a snapshot produced by snapshot().
+func (s *stateStore) restore(snap map[string]map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cells = snap
+	if s.cells == nil {
+		s.cells = make(map[string]map[string]any)
+	}
+}
+
 // StateContext scopes all state access to the key of the event currently
 // being processed. It is only valid inside a ProcessFunc call.
 type StateContext struct {

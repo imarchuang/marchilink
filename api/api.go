@@ -23,6 +23,9 @@ type Job struct {
 	parallelism     int
 	channelCapacity int
 	watermarkBound  time.Duration
+
+	dataDir         string
+	checkpointEvery time.Duration
 }
 
 // NewJob creates a named job.
@@ -97,6 +100,13 @@ func (j *Job) Process(fn runtime.ProcessFunc) *Job {
 	return j
 }
 
+// Checkpointing enables periodic checkpoints under {dataDir}/checkpoints/{name}.
+func (j *Job) Checkpointing(dataDir string, every time.Duration) *Job {
+	j.dataDir = dataDir
+	j.checkpointEvery = every
+	return j
+}
+
 // Graph builds the runtime graph for the job.
 func (j *Job) Graph() *runtime.Graph {
 	graph := runtime.NewGraph(j.source, j.mapFn, j.keyBy, j.sink)
@@ -108,6 +118,9 @@ func (j *Job) Graph() *runtime.Graph {
 	}
 	if j.assigner != nil {
 		graph.SetWindow(j.assigner, j.agg)
+	}
+	if j.dataDir != "" && j.checkpointEvery > 0 {
+		graph.SetCheckpointing(j.dataDir, j.name, j.checkpointEvery)
 	}
 	return graph
 }
