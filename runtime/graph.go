@@ -28,15 +28,21 @@ type WatermarkSnapshot struct {
 	PendingWindows int64       `json:"pendingWindows"`
 }
 
-// Graph is a minimal in-process DAG: source -> map -> keyBy -> window -> sink.
+// ProcessFunc is a stateful flat-map running inside a keyed subtask. State
+// accessed through the StateContext is scoped to the key of the input event.
+// It returns the events to emit downstream (empty slice = filter out).
+type ProcessFunc func(ctx *StateContext, event Event) ([]Event, error)
+
+// Graph is a minimal in-process DAG: source -> map -> keyBy -> process -> window -> sink.
 type Graph struct {
 	source Source
 	mapFn  MapFunc
 	keyBy  KeyFunc
 	sink   Sink
 
-	assigner WindowAssigner
-	agg      AggFactory
+	processFn ProcessFunc
+	assigner  WindowAssigner
+	agg       AggFactory
 
 	parallelism     int
 	channelCapacity int
@@ -47,10 +53,13 @@ type Graph struct {
 	subs     []*windowSubtask
 }
 
-// windowSubtask is one parallel instance of the window operator: its own
-// event-time clock plus its own slice of keyed window state.
+// windowSubtask is one parallel instance of the keyed operators: its own
+// event-time clock, its own keyed state store, and its own slice of window
+// state.
 type windowSubtask struct {
 	tracker *WatermarkTracker
+	store   *stateStore
+	sctx    *StateContext
 	states  map[string]map[Window]Aggregator
 	pending atomic.Int64
 	late    atomic.Int64
@@ -107,6 +116,11 @@ func (g *Graph) SetWindow(assigner WindowAssigner, agg AggFactory) {
 	g.agg = agg
 }
 
+// SetProcess enables the stateful process operator between keyBy and window.
+func (g *Graph) SetProcess(fn ProcessFunc) {
+	g.processFn = fn
+}
+
 // Watermarks returns the current watermark/window snapshot.
 func (g *Graph) Watermarks() WatermarkSnapshot {
 	g.mu.RLock()
@@ -126,6 +140,23 @@ func (g *Graph) Watermarks() WatermarkSnapshot {
 		snapshot.PendingWindows += st.pending.Load()
 	}
 	return snapshot
+}
+
+// StateSnapshot reports keyed state sizes per subtask: state name -> key count.
+type StateSnapshot struct {
+	Subtasks []map[string]int `json:"subtasks"`
+}
+
+// State returns the current keyed-state snapshot.
+func (g *Graph) State() StateSnapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	snap := StateSnapshot{}
+	for _, st := range g.subs {
+		snap.Subtasks = append(snap.Subtasks, st.store.keyCounts())
+	}
+	return snap
 }
 
 // Run executes the graph.
@@ -150,8 +181,11 @@ func (g *Graph) Run(ctx context.Context) error {
 	subs := make([]*windowSubtask, g.parallelism)
 	for i := range subChs {
 		subChs[i] = make(chan streamMsg, g.channelCapacity)
+		store := newStateStore()
 		subs[i] = &windowSubtask{
 			tracker: NewWatermarkTracker(1, 0),
+			store:   store,
+			sctx:    &StateContext{store: store},
 			states:  make(map[string]map[Window]Aggregator),
 		}
 	}
@@ -255,34 +289,46 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 				return err
 			}
 		default:
-			if g.assigner == nil {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case sinkCh <- m.event:
+			events := []Event{m.event}
+			if g.processFn != nil {
+				st.sctx.key = m.key
+				out, err := g.processFn(st.sctx, m.event)
+				if err != nil {
+					return fmt.Errorf("process: %w", err)
 				}
-				continue
+				events = out
 			}
 
-			clock := st.tracker.Current()
-			for _, w := range g.assigner.Assign(m.event.Timestamp) {
-				if !w.End.After(clock) {
-					// The window already fired: this record is late.
-					st.late.Add(1)
+			for _, event := range events {
+				if g.assigner == nil {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case sinkCh <- event:
+					}
 					continue
 				}
-				byWindow := st.states[m.key]
-				if byWindow == nil {
-					byWindow = make(map[Window]Aggregator)
-					st.states[m.key] = byWindow
+
+				clock := st.tracker.Current()
+				for _, w := range g.assigner.Assign(event.Timestamp) {
+					if !w.End.After(clock) {
+						// The window already fired: this record is late.
+						st.late.Add(1)
+						continue
+					}
+					byWindow := st.states[m.key]
+					if byWindow == nil {
+						byWindow = make(map[Window]Aggregator)
+						st.states[m.key] = byWindow
+					}
+					agg, ok := byWindow[w]
+					if !ok {
+						agg = g.agg()
+						byWindow[w] = agg
+						st.pending.Add(1)
+					}
+					agg.Add(event)
 				}
-				agg, ok := byWindow[w]
-				if !ok {
-					agg = g.agg()
-					byWindow[w] = agg
-					st.pending.Add(1)
-				}
-				agg.Add(m.event)
 			}
 		}
 	}
