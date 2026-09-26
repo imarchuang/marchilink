@@ -25,8 +25,9 @@ func main() {
 		windowSize  = flag.Duration("window", 5*time.Second, "window size")
 		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
-		dataDir     = flag.String("data-dir", "", "checkpoint data directory (empty = no checkpointing)")
-		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = disabled)")
+		dataDir     = flag.String("data-dir", "", "state backend directory (empty = no checkpoints/savepoints)")
+		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = savepoints only)")
+		resumeFrom  = flag.String("resume", "", "resume from named savepoint under {data-dir}/savepoints")
 	)
 	flag.Parse()
 
@@ -62,8 +63,11 @@ func main() {
 		WatermarkBound(*wmBound).
 		Sink(runtime.StdoutSink{Writer: os.Stdout})
 
-	if *dataDir != "" && *chkEvery > 0 {
+	if *dataDir != "" {
 		job.Checkpointing(*dataDir, *chkEvery)
+	}
+	if *resumeFrom != "" {
+		job.ResumeFrom(*resumeFrom)
 	}
 
 	switch *jobName {

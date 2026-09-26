@@ -26,6 +26,7 @@ type Job struct {
 
 	dataDir         string
 	checkpointEvery time.Duration
+	resumeFrom      string
 }
 
 // NewJob creates a named job.
@@ -100,10 +101,18 @@ func (j *Job) Process(fn runtime.ProcessFunc) *Job {
 	return j
 }
 
-// Checkpointing enables periodic checkpoints under {dataDir}/checkpoints/{name}.
+// Checkpointing enables the state backend under {dataDir}: periodic
+// checkpoints when every > 0, and on-demand savepoints either way.
 func (j *Job) Checkpointing(dataDir string, every time.Duration) *Job {
 	j.dataDir = dataDir
 	j.checkpointEvery = every
+	return j
+}
+
+// ResumeFrom makes the job restore from the named savepoint under
+// {dataDir}/savepoints/{name} instead of the latest checkpoint.
+func (j *Job) ResumeFrom(name string) *Job {
+	j.resumeFrom = name
 	return j
 }
 
@@ -119,8 +128,11 @@ func (j *Job) Graph() *runtime.Graph {
 	if j.assigner != nil {
 		graph.SetWindow(j.assigner, j.agg)
 	}
-	if j.dataDir != "" && j.checkpointEvery > 0 {
+	if j.dataDir != "" {
 		graph.SetCheckpointing(j.dataDir, j.name, j.checkpointEvery)
+	}
+	if j.resumeFrom != "" {
+		graph.SetResumeFrom(j.resumeFrom)
 	}
 	return graph
 }

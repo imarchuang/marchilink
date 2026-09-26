@@ -68,6 +68,12 @@ func newCheckpointStore(dataDir, jobID string) *checkpointStore {
 	return &checkpointStore{dir: filepath.Join(dataDir, "checkpoints", jobID)}
 }
 
+// newSavepointStore persists savepoints under {dataDir}/savepoints/{name}.
+// Same layout as checkpoints, but triggered manually and never auto-deleted.
+func newSavepointStore(dataDir, name string) *checkpointStore {
+	return &checkpointStore{dir: filepath.Join(dataDir, "savepoints", name)}
+}
+
 func (s *checkpointStore) chkDir(id checkpointID) string {
 	return filepath.Join(s.dir, fmt.Sprintf("chk-%06d", id))
 }
