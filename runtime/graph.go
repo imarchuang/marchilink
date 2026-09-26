@@ -703,6 +703,10 @@ func (g *Graph) restoreFrom(store *checkpointStore, subs []*windowSubtask) error
 // window state, watermark records advance the subtask's own clock and fire
 // due windows, barrier records trigger a state snapshot.
 func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh, sideCh chan<- Event, ackCh chan<- barrierAck) error {
+	merging := false
+	if ma, ok := g.assigner.(mergingAssigner); ok {
+		merging = ma.Merges()
+	}
 	for m := range in {
 		switch {
 		case m.isBarrier:
@@ -758,6 +762,42 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 					if byWindow == nil {
 						byWindow = make(map[Window]*windowCell)
 						st.states[m.key] = byWindow
+					}
+
+					if merging {
+						// Session windows: fold the event's window into any
+						// windows it touches. The too-late check runs on the
+						// merged bounds BEFORE mutating, so a too-late event
+						// never merges windows that should stay apart.
+						merged := mergeableWindow(byWindow, w)
+						if !merged.End.After(clock) && !clock.Before(merged.End.Add(g.allowedLateness)) {
+							st.late.Add(1)
+							if sideCh != nil {
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case sideCh <- event:
+								}
+							}
+							continue
+						}
+						if byWindow[merged] == nil {
+							// Fold all touched cells into a fresh one.
+							nc := &windowCell{agg: g.agg()}
+							for existing, cell := range byWindow {
+								if !windowsMerge(merged, existing) {
+									continue
+								}
+								if err := nc.agg.merge(cell.agg); err != nil {
+									return err
+								}
+								delete(byWindow, existing)
+								st.pending.Add(-1)
+							}
+							byWindow[merged] = nc
+							st.pending.Add(1)
+						}
+						w = merged
 					}
 
 					if !w.End.After(clock) {
@@ -854,6 +894,32 @@ func (g *Graph) emitWindow(ctx context.Context, sinkCh chan<- Event, key string,
 	case sinkCh <- result:
 		return nil
 	}
+}
+
+// mergeableWindow returns the union of w with every window in byWindow that
+// touches it, cascading until the bounds stop growing (a bridging event can
+// chain several windows into one session). Pure: no state is mutated.
+func mergeableWindow(byWindow map[Window]*windowCell, w Window) Window {
+	merged := w
+	for grown := true; grown; {
+		grown = false
+		for existing := range byWindow {
+			if existing == merged || !windowsMerge(merged, existing) {
+				continue
+			}
+			// Only real growth counts: a window fully inside merged must not
+			// keep the loop alive.
+			if existing.Start.Before(merged.Start) {
+				merged.Start = existing.Start
+				grown = true
+			}
+			if existing.End.After(merged.End) {
+				merged.End = existing.End
+				grown = true
+			}
+		}
+	}
+	return merged
 }
 
 func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {

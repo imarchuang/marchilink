@@ -24,6 +24,7 @@ func main() {
 		wmBound     = flag.Duration("watermark-bound", 2*time.Second, "bounded out-of-orderness for watermarks")
 		windowSize  = flag.Duration("window", 5*time.Second, "window size")
 		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
+		sessionGap  = flag.Duration("session", 0, "session window gap (overrides -window/-slide when > 0)")
 		lateness    = flag.Duration("lateness", 0, "allowed lateness for windows (0 = drop late records)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
 		dataDir     = flag.String("data-dir", "", "state backend directory (empty = no checkpoints/savepoints)")
@@ -78,9 +79,12 @@ func main() {
 		job.Process(runningCount)
 	default: // windowed-count
 		var assigner runtime.WindowAssigner
-		if *windowSlide > 0 {
+		switch {
+		case *sessionGap > 0:
+			assigner = runtime.Session(*sessionGap)
+		case *windowSlide > 0:
 			assigner = runtime.Sliding(*windowSize, *windowSlide)
-		} else {
+		default:
 			assigner = runtime.Tumbling(*windowSize)
 		}
 		job.Window(assigner, runtime.Count())
