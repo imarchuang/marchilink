@@ -462,7 +462,13 @@ func (g *Graph) Run(ctx context.Context) error {
 	}
 
 	var sourceOffset int64 = startOffset
-	sourceErr := g.source.Run(ctx, func(event Event) error {
+	// Sources that go idle (a marchiq topic with nothing new) still need to
+	// inject barriers; the hook is how they do it between polls. The closure
+	// reads sourceOffset, which only this goroutine writes.
+	runCtx := context.WithValue(ctx, barrierHookKey{}, func() error {
+		return injectBarrier(ctx, barrierReq, barrierInjected, subChs, sourceOffset)
+	})
+	sourceErr := g.source.Run(runCtx, func(event Event) error {
 		mapped := g.mapFn(event)
 		key := g.keyBy(mapped)
 		idx := routeKey(key, g.parallelism)
@@ -487,21 +493,7 @@ func (g *Graph) Run(ctx context.Context) error {
 		// If the coordinator asked for a barrier, inject it now: the barrier
 		// carries the offset of the NEXT record, i.e. all records before it
 		// have already been emitted.
-		select {
-		case id := <-barrierReq:
-			for _, ch := range subChs {
-				if err := sendMsg(ctx, ch, streamMsg{isBarrier: true, barrierID: id, barrierSnap: sourceOffset}); err != nil {
-					return err
-				}
-			}
-			select {
-			case barrierInjected <- sourceOffset:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		default:
-		}
-		return nil
+		return injectBarrier(ctx, barrierReq, barrierInjected, subChs, sourceOffset)
 	})
 	close(sourceDone)
 
@@ -981,6 +973,40 @@ func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {
 	case ch <- m:
 		return nil
 	}
+}
+
+// barrierHookKey carries an idle-source barrier injector on the Run context.
+type barrierHookKey struct{}
+
+// injectBarrier broadcasts a pending checkpoint barrier, if the coordinator
+// has asked for one. Non-blocking: no request means no barrier.
+func injectBarrier(ctx context.Context, barrierReq <-chan checkpointID, barrierInjected chan<- int64, subChs []chan streamMsg, sourceOffset int64) error {
+	select {
+	case id := <-barrierReq:
+		for _, ch := range subChs {
+			if err := sendMsg(ctx, ch, streamMsg{isBarrier: true, barrierID: id, barrierSnap: sourceOffset}); err != nil {
+				return err
+			}
+		}
+		select {
+		case barrierInjected <- sourceOffset:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	default:
+		return nil
+	}
+}
+
+// injectIdleBarrier lets a source inject a checkpoint barrier while it has
+// no records to emit. No-op unless Run installed the hook.
+func injectIdleBarrier(ctx context.Context) error {
+	hook, _ := ctx.Value(barrierHookKey{}).(func() error)
+	if hook == nil {
+		return nil
+	}
+	return hook()
 }
 
 // subtaskIndex finds a subtask's index by identity (used for barrier acks).

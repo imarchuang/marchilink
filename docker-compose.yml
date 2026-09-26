@@ -1,4 +1,47 @@
 services:
+  marchiq:
+    build: ../marchiq
+    ports:
+      - "9092:9092"
+    volumes:
+      - marchiq-data:/data
+    stop_grace_period: 10s
+
+  # The processor is started by scripts/demo-e2e.sh (not here) so the demo can
+  # kill -9 it and restart against the same checkpoint volume.
   marchilink:
     build: .
-    command: ["-count", "10", "-interval", "100ms"]
+    profiles: ["job"]
+    depends_on:
+      - marchiq
+    ports:
+      - "9081:9081"
+    volumes:
+      - marchilink-data:/data
+    command:
+      - -job
+      - windowed-count
+      - -broker
+      - http://marchiq:9092
+      - -topic
+      - events
+      - -out-topic
+      - counts
+      - -group
+      - flink
+      - -window
+      - 10s
+      - -watermark-bound
+      - 3s
+      - -checkpoint
+      - 2s
+      - -data-dir
+      - /data
+      - -http
+      - :9081
+      - -parallelism
+      - "1"
+
+volumes:
+  marchiq-data:
+  marchilink-data:
