@@ -9,12 +9,17 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
-// MarchiqSource consumes records from a marchiq topic via consumer-group
-// fetch. Offsets are checkpointed with the rest of the graph state and
-// committed to marchiq only when a checkpoint completes.
+// MarchiqSource consumes a marchiq topic. Reads use explicit offsets (the
+// position lives here and in checkpoints); the consumer-group commit is
+// published only when a checkpoint completes, and it carries the group
+// generation the broker fences commits with.
+//
+// Group fetch cannot do this: it always resumes at committed+1, so polling
+// before the next checkpoint would re-read the same records.
 type MarchiqSource struct {
 	Broker   string // e.g. "http://localhost:9092"
 	Topic    string
@@ -22,10 +27,14 @@ type MarchiqSource struct {
 	Member   string
 	MaxBatch int
 
-	client *http.Client
+	client     *http.Client
+	partitions []int
+	generation int
 
-	// offsets tracks the next offset to fetch per partition. Restored from
-	// checkpoint on recovery.
+	mu sync.Mutex
+	// offsets is the next offset to fetch per assigned partition. Restored
+	// from a checkpoint on recovery; the broker's committed offset is not
+	// the read cursor.
 	offsets map[int]int64
 	// pendingOffsets accumulates records fetched since the last completed
 	// checkpoint. Committed only on checkpoint completion.
@@ -44,40 +53,119 @@ func NewMarchiqSource(broker, topic, group, member string) (*MarchiqSource, erro
 		offsets:        make(map[int]int64),
 		pendingOffsets: make(map[int]int64),
 	}
-
-	// Join the group to get partition assignment.
-	joinURL := fmt.Sprintf("%s/groups/%s/join?topic=%s&member=%s&members=1",
-		s.Broker, url.PathEscape(s.Group), url.QueryEscape(s.Topic), url.QueryEscape(s.Member))
-	resp, err := s.client.Post(joinURL, "application/json", nil)
-	if err != nil {
-		return nil, fmt.Errorf("join group: %w", err)
+	if err := s.rejoin(context.Background()); err != nil {
+		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("join group: %s: %s", resp.Status, body)
-	}
-
 	return s, nil
 }
 
-// marchiqFetchResponse mirrors the marchiq group fetch JSON.
-type marchiqFetchResponse struct {
-	Partitions []struct {
-		Partition int `json:"partition"`
-		Records   []struct {
-			Offset      int64  `json:"offset"`
-			TimestampNS int64  `json:"timestamp_ns"`
-			Key         []byte `json:"key"`
-			Value       []byte `json:"value"`
-		} `json:"records"`
-		NextOffset    int64 `json:"next_offset"`
-		HighWatermark int64 `json:"high_watermark"`
-	} `json:"partitions"`
+type marchiqAssignment struct {
+	Generation int   `json:"generation"`
+	Partitions []int `json:"partitions"`
 }
 
-// Run implements Source. It polls marchiq for new records and emits them.
+// rejoin registers the member and refreshes the generation fence. It does
+// not touch fetch offsets: a rejoin after eviction must resume where the
+// checkpoint (or the local cursor) says, not at the broker's commit.
+func (s *MarchiqSource) rejoin(ctx context.Context) error {
+	joinURL := fmt.Sprintf("%s/groups/%s/join?topic=%s&member=%s",
+		s.Broker, url.PathEscape(s.Group), url.QueryEscape(s.Topic), url.QueryEscape(s.Member))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("join group: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("join group: %s: %s", resp.Status, body)
+	}
+	var asg marchiqAssignment
+	if err := json.Unmarshal(body, &asg); err != nil {
+		return fmt.Errorf("decode join response: %w", err)
+	}
+	if len(asg.Partitions) == 0 {
+		asg.Partitions = []int{0}
+	}
+	s.mu.Lock()
+	s.generation = asg.Generation
+	s.partitions = asg.Partitions
+	for _, p := range asg.Partitions {
+		if _, ok := s.offsets[p]; !ok {
+			s.offsets[p] = 0
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// heartbeat keeps the group session alive. The broker evicts a member that
+// misses the session timeout, which bumps the generation and fences our
+// commits. A 404/409 means we were evicted or fenced: rejoin.
+func (s *MarchiqSource) heartbeat(ctx context.Context) {
+	s.mu.Lock()
+	gen := s.generation
+	s.mu.Unlock()
+	hbURL := fmt.Sprintf("%s/groups/%s/heartbeat?topic=%s&member=%s&generation=%d",
+		s.Broker, url.PathEscape(s.Group), url.QueryEscape(s.Topic),
+		url.QueryEscape(s.Member), gen)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hbURL, nil)
+	if err != nil {
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusNotFound {
+		_ = s.rejoin(ctx)
+		return
+	}
+	var hr struct {
+		Generation int `json:"generation"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&hr) == nil && hr.Generation > 0 {
+		s.mu.Lock()
+		s.generation = hr.Generation
+		s.mu.Unlock()
+	}
+}
+
+type marchiqRecord struct {
+	Offset      int64  `json:"offset"`
+	TimestampNS int64  `json:"timestamp_ns"`
+	Key         []byte `json:"key"`
+	Value       []byte `json:"value"`
+}
+
+type marchiqExplicitFetch struct {
+	Records    []marchiqRecord `json:"records"`
+	NextOffset int64           `json:"next_offset"`
+}
+
+// Run implements Source. It polls each assigned partition from the local
+// offset and emits new records. An empty poll waits briefly and retries.
 func (s *MarchiqSource) Run(ctx context.Context, emit func(Event) error) error {
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+	go func() {
+		// Well inside marchiq's default 10s session timeout.
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				s.heartbeat(hbCtx)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -85,34 +173,25 @@ func (s *MarchiqSource) Run(ctx context.Context, emit func(Event) error) error {
 		default:
 		}
 
-		fetchURL := fmt.Sprintf("%s/fetch?group=%s&topic=%s&member=%s&max_records=%d",
-			s.Broker, url.QueryEscape(s.Group), url.QueryEscape(s.Topic),
-			url.QueryEscape(s.Member), s.MaxBatch)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
-		if err != nil {
-			return err
-		}
-		resp, err := s.client.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// Broker not ready yet; retry.
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		var fr marchiqFetchResponse
-		if err := json.NewDecoder(resp.Body).Decode(&fr); err != nil {
-			resp.Body.Close()
-			return fmt.Errorf("decode fetch response: %w", err)
-		}
-		resp.Body.Close()
+		s.mu.Lock()
+		parts := append([]int(nil), s.partitions...)
+		s.mu.Unlock()
 
 		anyRecords := false
-		for _, p := range fr.Partitions {
-			for _, rec := range p.Records {
+		for _, p := range parts {
+			s.mu.Lock()
+			offset := s.offsets[p]
+			s.mu.Unlock()
+
+			recs, err := s.fetchPartition(ctx, p, offset)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			for _, rec := range recs {
 				anyRecords = true
 				event := Event{
 					Key:       string(rec.Key),
@@ -122,14 +201,17 @@ func (s *MarchiqSource) Run(ctx context.Context, emit func(Event) error) error {
 				if err := emit(event); err != nil {
 					return err
 				}
-				// Track the next offset to fetch.
-				s.offsets[p.Partition] = rec.Offset + 1
-				s.pendingOffsets[p.Partition] = rec.Offset + 1
+				s.mu.Lock()
+				s.offsets[p] = rec.Offset + 1
+				s.pendingOffsets[p] = rec.Offset + 1
+				s.mu.Unlock()
 			}
 		}
 
 		if !anyRecords {
-			// No new records; poll again after a short delay.
+			if err := injectIdleBarrier(ctx); err != nil {
+				return err
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -139,12 +221,34 @@ func (s *MarchiqSource) Run(ctx context.Context, emit func(Event) error) error {
 	}
 }
 
-// Offset returns the current fetch position (next offset across partitions).
+func (s *MarchiqSource) fetchPartition(ctx context.Context, partition int, offset int64) ([]marchiqRecord, error) {
+	fetchURL := fmt.Sprintf("%s/fetch?topic=%s&partition=%d&offset=%d&max_records=%d",
+		s.Broker, url.QueryEscape(s.Topic), partition, offset, s.MaxBatch)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch partition %d offset %d: %s: %s", partition, offset, resp.Status, body)
+	}
+	var fr marchiqExplicitFetch
+	if err := json.Unmarshal(body, &fr); err != nil {
+		return nil, fmt.Errorf("decode fetch response: %w", err)
+	}
+	return fr.Records, nil
+}
+
+// Offset returns the minimum next-fetch offset across partitions.
 // Used by the checkpoint barrier to snapshot the source position.
 func (s *MarchiqSource) Offset() int64 {
-	// For single-partition topics this is exact. For multi-partition we
-	// return the minimum across partitions (conservative: replay a few extra
-	// records rather than skip any).
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var min int64 = -1
 	for _, off := range s.offsets {
 		if min < 0 || off < min {
@@ -159,23 +263,55 @@ func (s *MarchiqSource) Offset() int64 {
 
 // Seek rewinds the source to a checkpointed offset.
 func (s *MarchiqSource) Seek(offset int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for p := range s.offsets {
 		s.offsets[p] = offset
 	}
-	// Clear pending: we replay from the checkpoint, so anything fetched but
-	// not yet committed is discarded.
 	s.pendingOffsets = make(map[int]int64)
 }
 
 // CommitOffsets commits pending offsets to marchiq. Called by the coordinator
-// only after a checkpoint completes.
+// only after a checkpoint completes. The commit carries the group generation;
+// a fenced commit rejoins once and retries.
 func (s *MarchiqSource) CommitOffsets(ctx context.Context) error {
-	for partition, offset := range s.pendingOffsets {
+	s.mu.Lock()
+	pending := make(map[int]int64, len(s.pendingOffsets))
+	for k, v := range s.pendingOffsets {
+		pending[k] = v
+	}
+	gen := s.generation
+	s.mu.Unlock()
+
+	if err := s.commit(ctx, pending, gen); err != nil {
+		if err := s.rejoin(ctx); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		gen = s.generation
+		s.mu.Unlock()
+		if err := s.commit(ctx, pending, gen); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	for p, off := range pending {
+		if s.pendingOffsets[p] == off {
+			delete(s.pendingOffsets, p)
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *MarchiqSource) commit(ctx context.Context, pending map[int]int64, generation int) error {
+	for partition, offset := range pending {
 		body, _ := json.Marshal(map[string]any{
-			"group":     s.Group,
-			"topic":     s.Topic,
-			"partition": partition,
-			"offset":    offset - 1, // commit = last processed, next fetch = offset
+			"group":      s.Group,
+			"topic":      s.Topic,
+			"partition":  partition,
+			"offset":     offset - 1, // commit = last processed, next fetch = offset
+			"generation": generation,
 		})
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			s.Broker+"/commit", bytes.NewReader(body))
@@ -192,13 +328,13 @@ func (s *MarchiqSource) CommitOffsets(ctx context.Context) error {
 			return fmt.Errorf("commit partition %d offset %d: %s", partition, offset, resp.Status)
 		}
 	}
-	// Clear committed offsets.
-	s.pendingOffsets = make(map[int]int64)
 	return nil
 }
 
 // PendingOffsets returns a copy of offsets not yet committed.
 func (s *MarchiqSource) PendingOffsets() map[int]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := make(map[int]int64, len(s.pendingOffsets))
 	for k, v := range s.pendingOffsets {
 		out[k] = v
@@ -208,6 +344,8 @@ func (s *MarchiqSource) PendingOffsets() map[int]int64 {
 
 // OffsetMap returns a copy of current fetch positions.
 func (s *MarchiqSource) OffsetMap() map[int]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := make(map[int]int64, len(s.offsets))
 	for k, v := range s.offsets {
 		out[k] = v
@@ -217,6 +355,8 @@ func (s *MarchiqSource) OffsetMap() map[int]int64 {
 
 // RestoreOffsets sets fetch positions from a checkpoint.
 func (s *MarchiqSource) RestoreOffsets(offsets map[int]int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.offsets = make(map[int]int64, len(offsets))
 	for k, v := range offsets {
 		s.offsets[k] = v
@@ -226,13 +366,20 @@ func (s *MarchiqSource) RestoreOffsets(offsets map[int]int64) {
 
 // offsetString serializes the offset map for checkpoint storage.
 func (s *MarchiqSource) offsetString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, _ := json.Marshal(s.offsets)
 	return string(data)
 }
 
 // restoreOffsetString deserializes offsets from checkpoint storage.
 func (s *MarchiqSource) restoreOffsetString(data string) error {
-	return json.Unmarshal([]byte(data), &s.offsets)
+	var offsets map[int]int64
+	if err := json.Unmarshal([]byte(data), &offsets); err != nil {
+		return err
+	}
+	s.RestoreOffsets(offsets)
+	return nil
 }
 
 // parseOffset is a helper for tests.

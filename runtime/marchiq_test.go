@@ -65,18 +65,46 @@ func (m *mockMarchiq) handler() http.Handler {
 		m.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{
 			"group": group, "member": r.URL.Query().Get("member"),
-			"topic": topic, "partitions": []int{0},
+			"topic": topic, "generation": 1, "partitions": []int{0},
 		})
 	})
 
+	mux.HandleFunc("POST /groups/{group}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"generation": 1, "partitions": []int{0}})
+	})
+
 	mux.HandleFunc("GET /fetch", func(w http.ResponseWriter, r *http.Request) {
-		group := r.URL.Query().Get("group")
 		topic := r.URL.Query().Get("topic")
 		maxRecords, _ := strconv.Atoi(r.URL.Query().Get("max_records"))
 		if maxRecords <= 0 {
 			maxRecords = 100
 		}
 
+		// Explicit offset (the source's read cursor). Group mode remains for
+		// anything that still asks for it.
+		if offStr := r.URL.Query().Get("offset"); offStr != "" {
+			start, _ := strconv.ParseInt(offStr, 10, 64)
+			m.mu.Lock()
+			records := m.topics[topic]
+			var out []map[string]any
+			next := start
+			for i := start; i < int64(len(records)) && len(out) < maxRecords; i++ {
+				rec := records[i]
+				out = append(out, map[string]any{
+					"offset": rec.Offset, "timestamp_ns": rec.TimestampNS,
+					"key": []byte(rec.Key), "value": []byte(rec.Value),
+				})
+				next = rec.Offset + 1
+			}
+			m.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{
+				"topic": topic, "partition": 0, "records": out,
+				"next_offset": next, "high_watermark": int64(len(records)),
+			})
+			return
+		}
+
+		group := r.URL.Query().Get("group")
 		m.mu.Lock()
 		committed := m.groups[group][topic]
 		start := committed + 1
