@@ -24,6 +24,7 @@ func main() {
 		wmBound     = flag.Duration("watermark-bound", 2*time.Second, "bounded out-of-orderness for watermarks")
 		windowSize  = flag.Duration("window", 5*time.Second, "window size")
 		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
+		lateness    = flag.Duration("lateness", 0, "allowed lateness for windows (0 = drop late records)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
 		dataDir     = flag.String("data-dir", "", "state backend directory (empty = no checkpoints/savepoints)")
 		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = savepoints only)")
@@ -83,6 +84,14 @@ func main() {
 			assigner = runtime.Tumbling(*windowSize)
 		}
 		job.Window(assigner, runtime.Count())
+		if *lateness > 0 {
+			job.AllowedLateness(*lateness)
+			job.SideOutput(runtime.SinkFunc(func(_ context.Context, e runtime.Event) error {
+				_, err := fmt.Fprintf(os.Stdout, "%s LATE key=%s value=%s\n",
+					e.Timestamp.Format("15:04:05.000"), e.Key, e.Value)
+				return err
+			}))
+		}
 	}
 
 	graph := job.Graph()

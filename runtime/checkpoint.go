@@ -44,6 +44,9 @@ type subtaskSnapshot struct {
 type aggState struct {
 	Kind  string `json:"kind"`  // "count" or "sum"
 	Value string `json:"value"` // serialized result
+	// Fired records whether the window already fired; fired cells are kept
+	// until the allowed lateness expires so late records can re-fire.
+	Fired bool `json:"fired,omitempty"`
 }
 
 // windowKey encodes a Window as a map key.

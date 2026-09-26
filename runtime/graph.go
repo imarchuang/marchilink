@@ -45,6 +45,9 @@ type Graph struct {
 	assigner  WindowAssigner
 	agg       AggFactory
 
+	allowedLateness time.Duration
+	sideSink        Sink
+
 	parallelism     int
 	channelCapacity int
 	watermarkBound  time.Duration
@@ -74,9 +77,17 @@ type windowSubtask struct {
 	tracker *WatermarkTracker
 	store   *stateStore
 	sctx    *StateContext
-	states  map[string]map[Window]Aggregator
+	states  map[string]map[Window]*windowCell
 	pending atomic.Int64
 	late    atomic.Int64
+}
+
+// windowCell is one (key, window) state cell: the aggregator plus whether
+// the window has fired. Fired cells are kept until the allowed lateness
+// expires, so late records can re-fire the window with an updated result.
+type windowCell struct {
+	agg   Aggregator
+	fired bool
 }
 
 // streamMsg is what flows through a channel: a data record, a watermark
@@ -157,6 +168,21 @@ func (g *Graph) SetWindow(assigner WindowAssigner, agg AggFactory) {
 // SetProcess enables the stateful process operator between keyBy and window.
 func (g *Graph) SetProcess(fn ProcessFunc) {
 	g.processFn = fn
+}
+
+// SetAllowedLateness keeps fired window state for d after the watermark
+// passes the window end. Late records within d re-fire the window with an
+// updated result; records later than that go to the side output (or are
+// dropped and counted when no side output is set).
+func (g *Graph) SetAllowedLateness(d time.Duration) {
+	if d > 0 {
+		g.allowedLateness = d
+	}
+}
+
+// SetSideOutput sends too-late records to this sink instead of dropping them.
+func (g *Graph) SetSideOutput(sink Sink) {
+	g.sideSink = sink
 }
 
 // SetCheckpointing enables the state backend under {dataDir}: periodic
@@ -285,10 +311,31 @@ func (g *Graph) Run(ctx context.Context) error {
 			tracker: NewWatermarkTracker(1, 0),
 			store:   store,
 			sctx:    &StateContext{store: store},
-			states:  make(map[string]map[Window]Aggregator),
+			states:  make(map[string]map[Window]*windowCell),
 		}
 	}
 	sinkCh := make(chan Event, g.channelCapacity)
+
+	// Side output for too-late records; same drain-on-error pattern as the
+	// main sink so subtasks never block on a dead sink.
+	var sideCh chan Event
+	sideDone := make(chan error, 1)
+	if g.sideSink != nil {
+		sideCh = make(chan Event, g.channelCapacity)
+		go func() {
+			var sideErr error
+			for event := range sideCh {
+				if sideErr == nil {
+					if err := g.sideSink.Write(ctx, event); err != nil {
+						sideErr = err
+					}
+				}
+			}
+			sideDone <- sideErr
+		}()
+	} else {
+		close(sideDone)
+	}
 
 	g.mu.Lock()
 	g.sourceWM = NewWatermarkTracker(1, g.watermarkBound)
@@ -340,7 +387,7 @@ func (g *Graph) Run(ctx context.Context) error {
 		subWG.Add(1)
 		go func(idx int) {
 			defer subWG.Done()
-			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh, ackCh); err != nil {
+			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh, sideCh, ackCh); err != nil {
 				subErrs <- fmt.Errorf("window subtask %d: %w", idx, err)
 			}
 		}(i)
@@ -423,6 +470,12 @@ func (g *Graph) Run(ctx context.Context) error {
 	subWG.Wait()
 	close(sinkCh)
 	sinkErr := <-sinkDone
+	if sideCh != nil {
+		close(sideCh)
+	}
+	if sideErr := <-sideDone; sinkErr == nil {
+		sinkErr = sideErr
+	}
 
 	// Stop the coordinator.
 	if g.stateBackend {
@@ -617,9 +670,9 @@ func (g *Graph) restoreFrom(store *checkpointStore, subs []*windowSubtask) error
 		subs[i].late.Store(snap.Late)
 		subs[i].pending.Store(snap.Pending)
 
-		states := make(map[string]map[Window]Aggregator)
+		states := make(map[string]map[Window]*windowCell)
 		for key, byWindow := range snap.WindowState {
-			wm := make(map[Window]Aggregator, len(byWindow))
+			wm := make(map[Window]*windowCell, len(byWindow))
 			for wk, as := range byWindow {
 				w, err := parseWindowKey(wk)
 				if err != nil {
@@ -632,7 +685,7 @@ func (g *Graph) restoreFrom(store *checkpointStore, subs []*windowSubtask) error
 				if err := agg.restore(as.Value); err != nil {
 					return err
 				}
-				wm[w] = agg
+				wm[w] = &windowCell{agg: agg, fired: as.Fired}
 			}
 			states[key] = wm
 		}
@@ -649,7 +702,7 @@ func (g *Graph) restoreFrom(store *checkpointStore, subs []*windowSubtask) error
 // runSubtask is the loop of one window subtask: data records update keyed
 // window state, watermark records advance the subtask's own clock and fire
 // due windows, barrier records trigger a state snapshot.
-func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh chan<- Event, ackCh chan<- barrierAck) error {
+func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh, sideCh chan<- Event, ackCh chan<- barrierAck) error {
 	for m := range in {
 		switch {
 		case m.isBarrier:
@@ -667,14 +720,17 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 			case ackCh <- barrierAck{id: m.barrierID, idx: subtaskIndex(g, st), snap: snap, sourceOffset: m.barrierSnap}:
 			}
 		case m.isWM && m.final:
-			if err := g.fireWhere(ctx, st, sinkCh, func(Window) bool { return true }); err != nil {
+			// Bounded source ended: fire and purge everything.
+			if err := g.fireDue(ctx, st, sinkCh, finalWatermark); err != nil {
 				return err
 			}
+			g.purgeExpired(st, finalWatermark)
 		case m.isWM:
 			clock := st.tracker.UpdateInput(0, m.wm)
-			if err := g.fireWhere(ctx, st, sinkCh, func(w Window) bool { return !clock.Before(w.End) }); err != nil {
+			if err := g.fireDue(ctx, st, sinkCh, clock); err != nil {
 				return err
 			}
+			g.purgeExpired(st, clock)
 		default:
 			events := []Event{m.event}
 			if g.processFn != nil {
@@ -698,23 +754,50 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 
 				clock := st.tracker.Current()
 				for _, w := range g.assigner.Assign(event.Timestamp) {
-					if !w.End.After(clock) {
-						// The window already fired: this record is late.
-						st.late.Add(1)
-						continue
-					}
 					byWindow := st.states[m.key]
 					if byWindow == nil {
-						byWindow = make(map[Window]Aggregator)
+						byWindow = make(map[Window]*windowCell)
 						st.states[m.key] = byWindow
 					}
-					agg, ok := byWindow[w]
-					if !ok {
-						agg = g.agg()
-						byWindow[w] = agg
+
+					if !w.End.After(clock) {
+						// The window end has passed.
+						if clock.Before(w.End.Add(g.allowedLateness)) {
+							// Within allowed lateness: accept the record and
+							// re-fire the window with the updated result.
+							cell := byWindow[w]
+							if cell == nil {
+								cell = &windowCell{agg: g.agg()}
+								byWindow[w] = cell
+								st.pending.Add(1)
+							}
+							cell.agg.Add(event)
+							cell.fired = true
+							if err := g.emitWindow(ctx, sinkCh, m.key, w, cell); err != nil {
+								return err
+							}
+							continue
+						}
+						// Too late: side output if configured, else drop.
+						// Counted either way.
+						st.late.Add(1)
+						if sideCh != nil {
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case sideCh <- event:
+							}
+						}
+						continue
+					}
+
+					cell := byWindow[w]
+					if cell == nil {
+						cell = &windowCell{agg: g.agg()}
+						byWindow[w] = cell
 						st.pending.Add(1)
 					}
-					agg.Add(event)
+					cell.agg.Add(event)
 				}
 			}
 		}
@@ -722,22 +805,32 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 	return nil
 }
 
-// fireWhere emits and deletes every window matching pred.
-func (g *Graph) fireWhere(ctx context.Context, st *windowSubtask, sinkCh chan<- Event, pred func(Window) bool) error {
+// fireDue emits every unfired window whose end the clock has passed and marks
+// it fired. State is kept until purgeExpired reclaims it, so late records
+// within the allowed lateness can re-fire with updated results.
+func (g *Graph) fireDue(ctx context.Context, st *windowSubtask, sinkCh chan<- Event, clock time.Time) error {
 	for key, byWindow := range st.states {
-		for w, agg := range byWindow {
-			if !pred(w) {
+		for w, cell := range byWindow {
+			if cell.fired || clock.Before(w.End) {
 				continue
 			}
-			result := Event{
-				Key:       key,
-				Value:     fmt.Sprintf("window[%s~%s) %s", w.Start.Format("15:04:05"), w.End.Format("15:04:05"), agg.Result()),
-				Timestamp: w.End,
+			if err := g.emitWindow(ctx, sinkCh, key, w, cell); err != nil {
+				return err
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case sinkCh <- result:
+			cell.fired = true
+		}
+	}
+	return nil
+}
+
+// purgeExpired deletes windows whose end plus allowed lateness the clock has
+// passed. With zero lateness this coincides with firing; with lateness the
+// fired state lingers for re-fires until the purge horizon.
+func (g *Graph) purgeExpired(st *windowSubtask, clock time.Time) {
+	for key, byWindow := range st.states {
+		for w := range byWindow {
+			if clock.Before(w.End.Add(g.allowedLateness)) {
+				continue
 			}
 			delete(byWindow, w)
 			st.pending.Add(-1)
@@ -746,7 +839,21 @@ func (g *Graph) fireWhere(ctx context.Context, st *windowSubtask, sinkCh chan<- 
 			delete(st.states, key)
 		}
 	}
-	return nil
+}
+
+// emitWindow sends one window result downstream.
+func (g *Graph) emitWindow(ctx context.Context, sinkCh chan<- Event, key string, w Window, cell *windowCell) error {
+	result := Event{
+		Key:       key,
+		Value:     fmt.Sprintf("window[%s~%s) %s", w.Start.Format("15:04:05"), w.End.Format("15:04:05"), cell.agg.Result()),
+		Timestamp: w.End,
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case sinkCh <- result:
+		return nil
+	}
 }
 
 func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {
@@ -770,13 +877,13 @@ func subtaskIndex(g *Graph, target *windowSubtask) int {
 	return -1
 }
 
-// snapshotWindowState converts live window aggregators to a serializable form.
-func snapshotWindowState(states map[string]map[Window]Aggregator) map[string]map[string]aggState {
+// snapshotWindowState converts live window cells to a serializable form.
+func snapshotWindowState(states map[string]map[Window]*windowCell) map[string]map[string]aggState {
 	out := make(map[string]map[string]aggState, len(states))
 	for key, byWindow := range states {
 		wm := make(map[string]aggState, len(byWindow))
-		for w, agg := range byWindow {
-			wm[windowKey(w)] = aggState{Kind: agg.snapshotKind(), Value: agg.Result()}
+		for w, cell := range byWindow {
+			wm[windowKey(w)] = aggState{Kind: cell.agg.snapshotKind(), Value: cell.agg.Result(), Fired: cell.fired}
 		}
 		out[key] = wm
 	}
