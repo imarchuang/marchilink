@@ -68,6 +68,9 @@ type Graph struct {
 	store    *checkpointStore
 	history  []checkpointMeta
 	spReq    chan savepointRequest
+
+	// sourceCount counts records emitted by the source (for /debug/throughput).
+	sourceCount atomic.Int64
 }
 
 // windowSubtask is one parallel instance of the keyed operators: its own
@@ -80,6 +83,8 @@ type windowSubtask struct {
 	states  map[string]map[Window]*windowCell
 	pending atomic.Int64
 	late    atomic.Int64
+	// processed counts data records this subtask has handled.
+	processed atomic.Int64
 }
 
 // windowCell is one (key, window) state cell: the aggregator plus whether
@@ -284,6 +289,51 @@ func (g *Graph) State() StateSnapshot {
 	return snap
 }
 
+// SubtaskThroughput reports one subtask's processing progress.
+type SubtaskThroughput struct {
+	Index          int       `json:"index"`
+	Processed      int64     `json:"processed"`
+	Late           int64     `json:"late"`
+	PendingWindows int64     `json:"pendingWindows"`
+	Watermark      time.Time `json:"watermark"`
+	// WatermarkLagMs is wall-clock now minus the event-time watermark, in
+	// milliseconds; -1 when no watermark has been seen yet. Negative values
+	// are possible when event time runs ahead of wall clock (scripted demos).
+	WatermarkLagMs int64 `json:"watermarkLagMs"`
+}
+
+// ThroughputSnapshot reports source and per-subtask progress. Rates are
+// computed by the HTTP layer between successive samples.
+type ThroughputSnapshot struct {
+	SourceRecords int64               `json:"sourceRecords"`
+	Subtasks      []SubtaskThroughput `json:"subtasks"`
+}
+
+// Throughput returns raw progress counters for the graph.
+func (g *Graph) Throughput() ThroughputSnapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	now := time.Now()
+	snap := ThroughputSnapshot{SourceRecords: g.sourceCount.Load()}
+	for i, st := range g.subs {
+		wm := st.tracker.Current()
+		lag := int64(-1)
+		if !wm.IsZero() {
+			lag = now.Sub(wm).Milliseconds()
+		}
+		snap.Subtasks = append(snap.Subtasks, SubtaskThroughput{
+			Index:          i,
+			Processed:      st.processed.Load(),
+			Late:           st.late.Load(),
+			PendingWindows: st.pending.Load(),
+			Watermark:      wm,
+			WatermarkLagMs: lag,
+		})
+	}
+	return snap
+}
+
 // Run executes the graph.
 func (g *Graph) Run(ctx context.Context) error {
 	if g.source == nil {
@@ -422,6 +472,7 @@ func (g *Graph) Run(ctx context.Context) error {
 			return err
 		}
 		sourceOffset++
+		g.sourceCount.Add(1)
 
 		// Watermark advanced: broadcast it to every subtask, like Flink
 		// broadcasts watermark control records on all output channels.
@@ -736,6 +787,7 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 			}
 			g.purgeExpired(st, clock)
 		default:
+			st.processed.Add(1)
 			events := []Event{m.event}
 			if g.processFn != nil {
 				st.sctx.key = m.key

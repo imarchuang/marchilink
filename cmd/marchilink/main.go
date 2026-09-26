@@ -99,7 +99,8 @@ func main() {
 	}
 
 	graph := job.Graph()
-	server := &http.Server{Addr: *httpAddr, Handler: runtime.HTTPServer{Graph: graph}.Handler()}
+	observer := &runtime.HTTPServer{Graph: graph}
+	server := &http.Server{Addr: *httpAddr, Handler: observer.Handler()}
 
 	go func() {
 		<-ctx.Done()
