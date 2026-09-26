@@ -20,12 +20,16 @@ type Job struct {
 	assigner  runtime.WindowAssigner
 	agg       runtime.AggFactory
 
+	allowedLateness time.Duration
+	sideSink        runtime.Sink
+
 	parallelism     int
 	channelCapacity int
 	watermarkBound  time.Duration
 
 	dataDir         string
 	checkpointEvery time.Duration
+	resumeFrom      string
 }
 
 // NewJob creates a named job.
@@ -100,10 +104,32 @@ func (j *Job) Process(fn runtime.ProcessFunc) *Job {
 	return j
 }
 
-// Checkpointing enables periodic checkpoints under {dataDir}/checkpoints/{name}.
+// AllowedLateness keeps fired windows open for d; late records within d
+// re-fire the window with an updated result.
+func (j *Job) AllowedLateness(d time.Duration) *Job {
+	j.allowedLateness = d
+	return j
+}
+
+// SideOutput sends records later than the allowed lateness to this sink
+// instead of dropping them.
+func (j *Job) SideOutput(sink runtime.Sink) *Job {
+	j.sideSink = sink
+	return j
+}
+
+// Checkpointing enables the state backend under {dataDir}: periodic
+// checkpoints when every > 0, and on-demand savepoints either way.
 func (j *Job) Checkpointing(dataDir string, every time.Duration) *Job {
 	j.dataDir = dataDir
 	j.checkpointEvery = every
+	return j
+}
+
+// ResumeFrom makes the job restore from the named savepoint under
+// {dataDir}/savepoints/{name} instead of the latest checkpoint.
+func (j *Job) ResumeFrom(name string) *Job {
+	j.resumeFrom = name
 	return j
 }
 
@@ -119,8 +145,17 @@ func (j *Job) Graph() *runtime.Graph {
 	if j.assigner != nil {
 		graph.SetWindow(j.assigner, j.agg)
 	}
-	if j.dataDir != "" && j.checkpointEvery > 0 {
+	if j.allowedLateness > 0 {
+		graph.SetAllowedLateness(j.allowedLateness)
+	}
+	if j.sideSink != nil {
+		graph.SetSideOutput(j.sideSink)
+	}
+	if j.dataDir != "" {
 		graph.SetCheckpointing(j.dataDir, j.name, j.checkpointEvery)
+	}
+	if j.resumeFrom != "" {
+		graph.SetResumeFrom(j.resumeFrom)
 	}
 	return graph
 }

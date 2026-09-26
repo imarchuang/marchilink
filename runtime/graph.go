@@ -45,6 +45,9 @@ type Graph struct {
 	assigner  WindowAssigner
 	agg       AggFactory
 
+	allowedLateness time.Duration
+	sideSink        Sink
+
 	parallelism     int
 	channelCapacity int
 	watermarkBound  time.Duration
@@ -54,12 +57,20 @@ type Graph struct {
 	dataDir           string
 	checkpointEvery   time.Duration
 	checkpointEnabled bool
+	// stateBackend is on whenever dataDir is set: the coordinator runs (for
+	// savepoints and restore) even without periodic checkpoints.
+	stateBackend bool
+	resumeFrom   string
 
 	mu       sync.RWMutex
 	sourceWM *WatermarkTracker
 	subs     []*windowSubtask
 	store    *checkpointStore
 	history  []checkpointMeta
+	spReq    chan savepointRequest
+
+	// sourceCount counts records emitted by the source (for /debug/throughput).
+	sourceCount atomic.Int64
 }
 
 // windowSubtask is one parallel instance of the keyed operators: its own
@@ -69,9 +80,19 @@ type windowSubtask struct {
 	tracker *WatermarkTracker
 	store   *stateStore
 	sctx    *StateContext
-	states  map[string]map[Window]Aggregator
+	states  map[string]map[Window]*windowCell
 	pending atomic.Int64
 	late    atomic.Int64
+	// processed counts data records this subtask has handled.
+	processed atomic.Int64
+}
+
+// windowCell is one (key, window) state cell: the aggregator plus whether
+// the window has fired. Fired cells are kept until the allowed lateness
+// expires, so late records can re-fire the window with an updated result.
+type windowCell struct {
+	agg   Aggregator
+	fired bool
 }
 
 // streamMsg is what flows through a channel: a data record, a watermark
@@ -94,6 +115,18 @@ type barrierAck struct {
 	idx          int
 	snap         subtaskSnapshot
 	sourceOffset int64
+}
+
+// savepointRequest asks the coordinator for a named, manually triggered
+// snapshot. The coordinator replies on result when the savepoint completes.
+type savepointRequest struct {
+	name   string
+	result chan savepointResult
+}
+
+type savepointResult struct {
+	meta checkpointMeta
+	err  error
 }
 
 // NewGraph builds a source -> map -> keyBy -> sink graph.
@@ -142,14 +175,70 @@ func (g *Graph) SetProcess(fn ProcessFunc) {
 	g.processFn = fn
 }
 
-// SetCheckpointing enables periodic checkpoints under {dataDir}/checkpoints/{jobID}.
+// SetAllowedLateness keeps fired window state for d after the watermark
+// passes the window end. Late records within d re-fire the window with an
+// updated result; records later than that go to the side output (or are
+// dropped and counted when no side output is set).
+func (g *Graph) SetAllowedLateness(d time.Duration) {
+	if d > 0 {
+		g.allowedLateness = d
+	}
+}
+
+// SetSideOutput sends too-late records to this sink instead of dropping them.
+func (g *Graph) SetSideOutput(sink Sink) {
+	g.sideSink = sink
+}
+
+// SetCheckpointing enables the state backend under {dataDir}: periodic
+// checkpoints under checkpoints/{jobID} when every > 0, and on-demand
+// savepoints under savepoints/{name} regardless of the interval.
 func (g *Graph) SetCheckpointing(dataDir, jobID string, every time.Duration) {
-	if dataDir != "" && every > 0 {
-		g.dataDir = dataDir
-		g.jobID = jobID
+	if dataDir == "" {
+		return
+	}
+	g.dataDir = dataDir
+	g.jobID = jobID
+	g.store = newCheckpointStore(dataDir, jobID)
+	g.stateBackend = true
+	if every > 0 {
 		g.checkpointEvery = every
 		g.checkpointEnabled = true
-		g.store = newCheckpointStore(dataDir, jobID)
+	}
+}
+
+// SetResumeFrom makes the next Run restore from the named savepoint under
+// {dataDir}/savepoints/{name} instead of the latest checkpoint.
+func (g *Graph) SetResumeFrom(name string) {
+	g.resumeFrom = name
+}
+
+// TriggerSavepoint asks the coordinator for a named savepoint and waits for
+// it to complete. Savepoints use the checkpoint format but live under
+// savepoints/{name} and are never auto-deleted.
+func (g *Graph) TriggerSavepoint(ctx context.Context, name string) (checkpointMeta, error) {
+	g.mu.RLock()
+	ch := g.spReq
+	enabled := g.stateBackend
+	g.mu.RUnlock()
+	if !enabled {
+		return checkpointMeta{}, errors.New("state backend disabled: run with a data directory")
+	}
+	if ch == nil {
+		return checkpointMeta{}, errors.New("job is not running")
+	}
+
+	req := savepointRequest{name: name, result: make(chan savepointResult, 1)}
+	select {
+	case ch <- req:
+	case <-ctx.Done():
+		return checkpointMeta{}, ctx.Err()
+	}
+	select {
+	case res := <-req.result:
+		return res.meta, res.err
+	case <-ctx.Done():
+		return checkpointMeta{}, ctx.Err()
 	}
 }
 
@@ -200,6 +289,51 @@ func (g *Graph) State() StateSnapshot {
 	return snap
 }
 
+// SubtaskThroughput reports one subtask's processing progress.
+type SubtaskThroughput struct {
+	Index          int       `json:"index"`
+	Processed      int64     `json:"processed"`
+	Late           int64     `json:"late"`
+	PendingWindows int64     `json:"pendingWindows"`
+	Watermark      time.Time `json:"watermark"`
+	// WatermarkLagMs is wall-clock now minus the event-time watermark, in
+	// milliseconds; -1 when no watermark has been seen yet. Negative values
+	// are possible when event time runs ahead of wall clock (scripted demos).
+	WatermarkLagMs int64 `json:"watermarkLagMs"`
+}
+
+// ThroughputSnapshot reports source and per-subtask progress. Rates are
+// computed by the HTTP layer between successive samples.
+type ThroughputSnapshot struct {
+	SourceRecords int64               `json:"sourceRecords"`
+	Subtasks      []SubtaskThroughput `json:"subtasks"`
+}
+
+// Throughput returns raw progress counters for the graph.
+func (g *Graph) Throughput() ThroughputSnapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	now := time.Now()
+	snap := ThroughputSnapshot{SourceRecords: g.sourceCount.Load()}
+	for i, st := range g.subs {
+		wm := st.tracker.Current()
+		lag := int64(-1)
+		if !wm.IsZero() {
+			lag = now.Sub(wm).Milliseconds()
+		}
+		snap.Subtasks = append(snap.Subtasks, SubtaskThroughput{
+			Index:          i,
+			Processed:      st.processed.Load(),
+			Late:           st.late.Load(),
+			PendingWindows: st.pending.Load(),
+			Watermark:      wm,
+			WatermarkLagMs: lag,
+		})
+	}
+	return snap
+}
+
 // Run executes the graph.
 func (g *Graph) Run(ctx context.Context) error {
 	if g.source == nil {
@@ -227,30 +361,53 @@ func (g *Graph) Run(ctx context.Context) error {
 			tracker: NewWatermarkTracker(1, 0),
 			store:   store,
 			sctx:    &StateContext{store: store},
-			states:  make(map[string]map[Window]Aggregator),
+			states:  make(map[string]map[Window]*windowCell),
 		}
 	}
 	sinkCh := make(chan Event, g.channelCapacity)
+
+	// Side output for too-late records; same drain-on-error pattern as the
+	// main sink so subtasks never block on a dead sink.
+	var sideCh chan Event
+	sideDone := make(chan error, 1)
+	if g.sideSink != nil {
+		sideCh = make(chan Event, g.channelCapacity)
+		go func() {
+			var sideErr error
+			for event := range sideCh {
+				if sideErr == nil {
+					if err := g.sideSink.Write(ctx, event); err != nil {
+						sideErr = err
+					}
+				}
+			}
+			sideDone <- sideErr
+		}()
+	} else {
+		close(sideDone)
+	}
 
 	g.mu.Lock()
 	g.sourceWM = NewWatermarkTracker(1, g.watermarkBound)
 	g.subs = subs
 	g.mu.Unlock()
 
-	// Restore from the latest completed checkpoint, if any.
+	// Restore from the latest completed checkpoint — or from the named
+	// savepoint when resuming manually.
 	var startOffset int64
-	if g.checkpointEnabled {
-		if err := g.restoreLatest(subs); err != nil {
+	if g.stateBackend {
+		restoreStore := g.store
+		if g.resumeFrom != "" {
+			restoreStore = newSavepointStore(g.dataDir, g.resumeFrom)
+		}
+		if err := g.restoreFrom(restoreStore, subs); err != nil {
 			return fmt.Errorf("restore: %w", err)
 		}
 		if off, ok := g.source.(interface{ Offset() int64 }); ok {
 			startOffset = off.Offset()
 		}
-	}
-
-	// For marchiq sources, restore per-partition offsets from checkpoint.
-	if g.checkpointEnabled {
-		if _, srcState, _, err := g.store.loadLatest(); err == nil && len(srcState.Offsets) > 0 {
+		// For marchiq sources, restore per-partition offsets from the same store.
+		if _, srcState, _, err := restoreStore.loadLatest(); err == nil && len(srcState.Offsets) > 0 {
 			if restorer, ok := g.source.(interface{ RestoreOffsets(map[int]int64) }); ok {
 				restorer.RestoreOffsets(srcState.Offsets)
 			}
@@ -280,7 +437,7 @@ func (g *Graph) Run(ctx context.Context) error {
 		subWG.Add(1)
 		go func(idx int) {
 			defer subWG.Done()
-			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh, ackCh); err != nil {
+			if err := g.runSubtask(ctx, subs[idx], subChs[idx], sinkCh, sideCh, ackCh); err != nil {
 				subErrs <- fmt.Errorf("window subtask %d: %w", idx, err)
 			}
 		}(i)
@@ -292,10 +449,14 @@ func (g *Graph) Run(ctx context.Context) error {
 	// in the stream before waiting for acks.
 	barrierReq := make(chan checkpointID)
 	barrierInjected := make(chan int64) // source offset at barrier
+	savepointReqs := make(chan savepointRequest)
 	coordDone := make(chan struct{})
 	sourceDone := make(chan struct{})
-	if g.checkpointEnabled {
-		go g.runCoordinator(ctx, barrierReq, barrierInjected, ackCh, coordDone, sourceDone)
+	if g.stateBackend {
+		g.mu.Lock()
+		g.spReq = savepointReqs
+		g.mu.Unlock()
+		go g.runCoordinator(ctx, barrierReq, barrierInjected, ackCh, savepointReqs, coordDone, sourceDone)
 	} else {
 		close(coordDone)
 	}
@@ -311,6 +472,7 @@ func (g *Graph) Run(ctx context.Context) error {
 			return err
 		}
 		sourceOffset++
+		g.sourceCount.Add(1)
 
 		// Watermark advanced: broadcast it to every subtask, like Flink
 		// broadcasts watermark control records on all output channels.
@@ -359,9 +521,15 @@ func (g *Graph) Run(ctx context.Context) error {
 	subWG.Wait()
 	close(sinkCh)
 	sinkErr := <-sinkDone
+	if sideCh != nil {
+		close(sideCh)
+	}
+	if sideErr := <-sideDone; sinkErr == nil {
+		sinkErr = sideErr
+	}
 
 	// Stop the coordinator.
-	if g.checkpointEnabled {
+	if g.stateBackend {
 		close(barrierReq)
 	}
 	<-coordDone
@@ -377,12 +545,23 @@ func (g *Graph) Run(ctx context.Context) error {
 	return sinkErr
 }
 
-// runCoordinator triggers a checkpoint every interval, waits for all subtask
-// acks, then atomically publishes the checkpoint.
-func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID, barrierInjected <-chan int64, ackCh <-chan barrierAck, done chan<- struct{}, sourceDone <-chan struct{}) {
+// errSourceEnded marks snapshot attempts that lose the race with a bounded
+// source finishing.
+var errSourceEnded = errors.New("source ended")
+
+// runCoordinator triggers a checkpoint every interval and serves savepoint
+// requests. Each round injects a barrier, waits for all subtask acks, then
+// atomically publishes the snapshot. With checkpointing disabled the ticker
+// channel is nil and only savepoints are served.
+func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID, barrierInjected <-chan int64, ackCh <-chan barrierAck, spReq <-chan savepointRequest, done chan<- struct{}, sourceDone <-chan struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(g.checkpointEvery)
-	defer ticker.Stop()
+
+	var tickC <-chan time.Time
+	if g.checkpointEnabled {
+		ticker := time.NewTicker(g.checkpointEvery)
+		defer ticker.Stop()
+		tickC = ticker.C
+	}
 
 	var nextID checkpointID = 1
 	// If we restored from a checkpoint, continue numbering after it.
@@ -392,92 +571,139 @@ func (g *Graph) runCoordinator(ctx context.Context, barrierReq chan checkpointID
 
 	sourceEnded := false
 	for {
+		if sourceEnded {
+			// No more snapshots are possible: subtasks have drained. Stay
+			// alive to reject savepoint requests until Run shuts us down by
+			// closing barrierReq.
+			select {
+			case <-ctx.Done():
+				return
+			case <-barrierReq:
+				return
+			case sp := <-spReq:
+				sp.result <- savepointResult{err: errSourceEnded}
+			}
+			continue
+		}
+
+		var sp *savepointRequest
 		select {
 		case <-ctx.Done():
 			return
 		case <-sourceDone:
 			sourceEnded = true
-		case <-ticker.C:
-		}
-		if sourceEnded {
-			return
-		}
-
-		id := nextID
-		started := time.Now()
-
-		// Ask the source to inject a barrier, then wait for it to confirm.
-		select {
-		case barrierReq <- id:
-		case <-ctx.Done():
-			return
-		case <-sourceDone:
-			return
-		}
-		var srcOffset int64
-		select {
-		case srcOffset = <-barrierInjected:
-		case <-ctx.Done():
-			return
-		case <-sourceDone:
-			return
+			continue
+		case <-tickC:
+		case req := <-spReq:
+			sp = &req
 		}
 
-		// For marchiq sources, snapshot per-partition offsets.
-		var srcOffsets map[int]int64
-		if om, ok := g.source.(interface{ OffsetMap() map[int]int64 }); ok {
-			srcOffsets = om.OffsetMap()
-		}
-
-		// Wait for every subtask to ack with its snapshot.
-		snaps := make([]subtaskSnapshot, g.parallelism)
-		acked := 0
-		for acked < g.parallelism {
-			select {
-			case <-ctx.Done():
-				return
-			case ack := <-ackCh:
-				if ack.id != id {
-					continue
+		meta, src, snaps, err := g.snapshotOnce(ctx, nextID, barrierReq, barrierInjected, ackCh, sourceDone)
+		if err != nil {
+			if errors.Is(err, errSourceEnded) {
+				sourceEnded = true
+				if sp != nil {
+					sp.result <- savepointResult{err: err}
 				}
-				snaps[ack.idx] = ack.snap
-				acked++
+				continue
 			}
+			return // ctx cancelled
 		}
 
-		meta := checkpointMeta{
-			ID:          id,
-			JobID:       g.jobID,
-			StartedAt:   started,
-			FinishedAt:  time.Now(),
-			Parallelism: g.parallelism,
-			Status:      "completed",
+		// Periodic checkpoints go to the checkpoint store; savepoints go to
+		// their named directory and are never auto-deleted.
+		store := g.store
+		if sp != nil {
+			store = newSavepointStore(g.dataDir, sp.name)
 		}
-		if err := g.store.write(meta, sourceState{Offset: srcOffset, Offsets: srcOffsets}, snaps); err != nil {
-			// Log and continue; a failed checkpoint must not kill the job.
+		if err := store.write(meta, src, snaps); err != nil {
+			// A failed snapshot must not kill the job.
+			if sp != nil {
+				sp.result <- savepointResult{err: fmt.Errorf("write savepoint: %w", err)}
+			}
 			continue
 		}
 
-		// Checkpoint completed: commit source offsets to marchiq.
+		// Snapshot completed: commit source offsets to marchiq.
 		if committer, ok := g.source.(interface{ CommitOffsets(context.Context) error }); ok {
-			if err := committer.CommitOffsets(ctx); err != nil {
-				// Log and continue; offsets will be re-committed on the next
-				// checkpoint or replayed on recovery.
-				_ = err
-			}
+			// On failure, offsets are re-committed on the next checkpoint or
+			// replayed on recovery.
+			_ = committer.CommitOffsets(ctx)
 		}
 
+		nextID++
+		if sp != nil {
+			sp.result <- savepointResult{meta: meta}
+			continue
+		}
 		g.mu.Lock()
 		g.history = append(g.history, meta)
 		g.mu.Unlock()
-		nextID++
 	}
 }
 
-// restoreLatest loads the latest completed checkpoint into subtask state and
-// rewinds the source.
-func (g *Graph) restoreLatest(subs []*windowSubtask) error {
-	meta, src, snaps, err := g.store.loadLatest()
+// snapshotOnce runs one barrier round: the source injects the barrier after
+// the current record, every subtask acks with its snapshot, and the captured
+// state is returned. Nothing is written yet — the caller decides where to
+// publish (checkpoint store vs named savepoint).
+func (g *Graph) snapshotOnce(ctx context.Context, id checkpointID, barrierReq chan<- checkpointID, barrierInjected <-chan int64, ackCh <-chan barrierAck, sourceDone <-chan struct{}) (checkpointMeta, sourceState, []subtaskSnapshot, error) {
+	started := time.Now()
+
+	// Ask the source to inject a barrier, then wait for it to confirm.
+	select {
+	case barrierReq <- id:
+	case <-ctx.Done():
+		return checkpointMeta{}, sourceState{}, nil, ctx.Err()
+	case <-sourceDone:
+		return checkpointMeta{}, sourceState{}, nil, errSourceEnded
+	}
+	var srcOffset int64
+	select {
+	case srcOffset = <-barrierInjected:
+	case <-ctx.Done():
+		return checkpointMeta{}, sourceState{}, nil, ctx.Err()
+	case <-sourceDone:
+		return checkpointMeta{}, sourceState{}, nil, errSourceEnded
+	}
+
+	// For marchiq sources, snapshot per-partition offsets.
+	var srcOffsets map[int]int64
+	if om, ok := g.source.(interface{ OffsetMap() map[int]int64 }); ok {
+		srcOffsets = om.OffsetMap()
+	}
+
+	// Wait for every subtask to ack with its snapshot. The barrier is already
+	// in the channels, so acks arrive even if the source ends meanwhile.
+	snaps := make([]subtaskSnapshot, g.parallelism)
+	acked := 0
+	for acked < g.parallelism {
+		select {
+		case <-ctx.Done():
+			return checkpointMeta{}, sourceState{}, nil, ctx.Err()
+		case ack := <-ackCh:
+			if ack.id != id {
+				continue
+			}
+			snaps[ack.idx] = ack.snap
+			acked++
+		}
+	}
+
+	meta := checkpointMeta{
+		ID:          id,
+		JobID:       g.jobID,
+		StartedAt:   started,
+		FinishedAt:  time.Now(),
+		Parallelism: g.parallelism,
+		Status:      "completed",
+	}
+	return meta, sourceState{Offset: srcOffset, Offsets: srcOffsets}, snaps, nil
+}
+
+// restoreFrom loads the latest completed snapshot in store into subtask state
+// and rewinds the source.
+func (g *Graph) restoreFrom(store *checkpointStore, subs []*windowSubtask) error {
+	meta, src, snaps, err := store.loadLatest()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // no checkpoint yet
@@ -495,9 +721,9 @@ func (g *Graph) restoreLatest(subs []*windowSubtask) error {
 		subs[i].late.Store(snap.Late)
 		subs[i].pending.Store(snap.Pending)
 
-		states := make(map[string]map[Window]Aggregator)
+		states := make(map[string]map[Window]*windowCell)
 		for key, byWindow := range snap.WindowState {
-			wm := make(map[Window]Aggregator, len(byWindow))
+			wm := make(map[Window]*windowCell, len(byWindow))
 			for wk, as := range byWindow {
 				w, err := parseWindowKey(wk)
 				if err != nil {
@@ -510,7 +736,7 @@ func (g *Graph) restoreLatest(subs []*windowSubtask) error {
 				if err := agg.restore(as.Value); err != nil {
 					return err
 				}
-				wm[w] = agg
+				wm[w] = &windowCell{agg: agg, fired: as.Fired}
 			}
 			states[key] = wm
 		}
@@ -527,7 +753,11 @@ func (g *Graph) restoreLatest(subs []*windowSubtask) error {
 // runSubtask is the loop of one window subtask: data records update keyed
 // window state, watermark records advance the subtask's own clock and fire
 // due windows, barrier records trigger a state snapshot.
-func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh chan<- Event, ackCh chan<- barrierAck) error {
+func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan streamMsg, sinkCh, sideCh chan<- Event, ackCh chan<- barrierAck) error {
+	merging := false
+	if ma, ok := g.assigner.(mergingAssigner); ok {
+		merging = ma.Merges()
+	}
 	for m := range in {
 		switch {
 		case m.isBarrier:
@@ -545,15 +775,19 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 			case ackCh <- barrierAck{id: m.barrierID, idx: subtaskIndex(g, st), snap: snap, sourceOffset: m.barrierSnap}:
 			}
 		case m.isWM && m.final:
-			if err := g.fireWhere(ctx, st, sinkCh, func(Window) bool { return true }); err != nil {
+			// Bounded source ended: fire and purge everything.
+			if err := g.fireDue(ctx, st, sinkCh, finalWatermark); err != nil {
 				return err
 			}
+			g.purgeExpired(st, finalWatermark)
 		case m.isWM:
 			clock := st.tracker.UpdateInput(0, m.wm)
-			if err := g.fireWhere(ctx, st, sinkCh, func(w Window) bool { return !clock.Before(w.End) }); err != nil {
+			if err := g.fireDue(ctx, st, sinkCh, clock); err != nil {
 				return err
 			}
+			g.purgeExpired(st, clock)
 		default:
+			st.processed.Add(1)
 			events := []Event{m.event}
 			if g.processFn != nil {
 				st.sctx.key = m.key
@@ -576,23 +810,86 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 
 				clock := st.tracker.Current()
 				for _, w := range g.assigner.Assign(event.Timestamp) {
-					if !w.End.After(clock) {
-						// The window already fired: this record is late.
-						st.late.Add(1)
-						continue
-					}
 					byWindow := st.states[m.key]
 					if byWindow == nil {
-						byWindow = make(map[Window]Aggregator)
+						byWindow = make(map[Window]*windowCell)
 						st.states[m.key] = byWindow
 					}
-					agg, ok := byWindow[w]
-					if !ok {
-						agg = g.agg()
-						byWindow[w] = agg
+
+					if merging {
+						// Session windows: fold the event's window into any
+						// windows it touches. The too-late check runs on the
+						// merged bounds BEFORE mutating, so a too-late event
+						// never merges windows that should stay apart.
+						merged := mergeableWindow(byWindow, w)
+						if !merged.End.After(clock) && !clock.Before(merged.End.Add(g.allowedLateness)) {
+							st.late.Add(1)
+							if sideCh != nil {
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case sideCh <- event:
+								}
+							}
+							continue
+						}
+						if byWindow[merged] == nil {
+							// Fold all touched cells into a fresh one.
+							nc := &windowCell{agg: g.agg()}
+							for existing, cell := range byWindow {
+								if !windowsMerge(merged, existing) {
+									continue
+								}
+								if err := nc.agg.merge(cell.agg); err != nil {
+									return err
+								}
+								delete(byWindow, existing)
+								st.pending.Add(-1)
+							}
+							byWindow[merged] = nc
+							st.pending.Add(1)
+						}
+						w = merged
+					}
+
+					if !w.End.After(clock) {
+						// The window end has passed.
+						if clock.Before(w.End.Add(g.allowedLateness)) {
+							// Within allowed lateness: accept the record and
+							// re-fire the window with the updated result.
+							cell := byWindow[w]
+							if cell == nil {
+								cell = &windowCell{agg: g.agg()}
+								byWindow[w] = cell
+								st.pending.Add(1)
+							}
+							cell.agg.Add(event)
+							cell.fired = true
+							if err := g.emitWindow(ctx, sinkCh, m.key, w, cell); err != nil {
+								return err
+							}
+							continue
+						}
+						// Too late: side output if configured, else drop.
+						// Counted either way.
+						st.late.Add(1)
+						if sideCh != nil {
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case sideCh <- event:
+							}
+						}
+						continue
+					}
+
+					cell := byWindow[w]
+					if cell == nil {
+						cell = &windowCell{agg: g.agg()}
+						byWindow[w] = cell
 						st.pending.Add(1)
 					}
-					agg.Add(event)
+					cell.agg.Add(event)
 				}
 			}
 		}
@@ -600,22 +897,32 @@ func (g *Graph) runSubtask(ctx context.Context, st *windowSubtask, in <-chan str
 	return nil
 }
 
-// fireWhere emits and deletes every window matching pred.
-func (g *Graph) fireWhere(ctx context.Context, st *windowSubtask, sinkCh chan<- Event, pred func(Window) bool) error {
+// fireDue emits every unfired window whose end the clock has passed and marks
+// it fired. State is kept until purgeExpired reclaims it, so late records
+// within the allowed lateness can re-fire with updated results.
+func (g *Graph) fireDue(ctx context.Context, st *windowSubtask, sinkCh chan<- Event, clock time.Time) error {
 	for key, byWindow := range st.states {
-		for w, agg := range byWindow {
-			if !pred(w) {
+		for w, cell := range byWindow {
+			if cell.fired || clock.Before(w.End) {
 				continue
 			}
-			result := Event{
-				Key:       key,
-				Value:     fmt.Sprintf("window[%s~%s) %s", w.Start.Format("15:04:05"), w.End.Format("15:04:05"), agg.Result()),
-				Timestamp: w.End,
+			if err := g.emitWindow(ctx, sinkCh, key, w, cell); err != nil {
+				return err
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case sinkCh <- result:
+			cell.fired = true
+		}
+	}
+	return nil
+}
+
+// purgeExpired deletes windows whose end plus allowed lateness the clock has
+// passed. With zero lateness this coincides with firing; with lateness the
+// fired state lingers for re-fires until the purge horizon.
+func (g *Graph) purgeExpired(st *windowSubtask, clock time.Time) {
+	for key, byWindow := range st.states {
+		for w := range byWindow {
+			if clock.Before(w.End.Add(g.allowedLateness)) {
+				continue
 			}
 			delete(byWindow, w)
 			st.pending.Add(-1)
@@ -624,7 +931,47 @@ func (g *Graph) fireWhere(ctx context.Context, st *windowSubtask, sinkCh chan<- 
 			delete(st.states, key)
 		}
 	}
-	return nil
+}
+
+// emitWindow sends one window result downstream.
+func (g *Graph) emitWindow(ctx context.Context, sinkCh chan<- Event, key string, w Window, cell *windowCell) error {
+	result := Event{
+		Key:       key,
+		Value:     fmt.Sprintf("window[%s~%s) %s", w.Start.Format("15:04:05"), w.End.Format("15:04:05"), cell.agg.Result()),
+		Timestamp: w.End,
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case sinkCh <- result:
+		return nil
+	}
+}
+
+// mergeableWindow returns the union of w with every window in byWindow that
+// touches it, cascading until the bounds stop growing (a bridging event can
+// chain several windows into one session). Pure: no state is mutated.
+func mergeableWindow(byWindow map[Window]*windowCell, w Window) Window {
+	merged := w
+	for grown := true; grown; {
+		grown = false
+		for existing := range byWindow {
+			if existing == merged || !windowsMerge(merged, existing) {
+				continue
+			}
+			// Only real growth counts: a window fully inside merged must not
+			// keep the loop alive.
+			if existing.Start.Before(merged.Start) {
+				merged.Start = existing.Start
+				grown = true
+			}
+			if existing.End.After(merged.End) {
+				merged.End = existing.End
+				grown = true
+			}
+		}
+	}
+	return merged
 }
 
 func sendMsg(ctx context.Context, ch chan<- streamMsg, m streamMsg) error {
@@ -648,13 +995,13 @@ func subtaskIndex(g *Graph, target *windowSubtask) int {
 	return -1
 }
 
-// snapshotWindowState converts live window aggregators to a serializable form.
-func snapshotWindowState(states map[string]map[Window]Aggregator) map[string]map[string]aggState {
+// snapshotWindowState converts live window cells to a serializable form.
+func snapshotWindowState(states map[string]map[Window]*windowCell) map[string]map[string]aggState {
 	out := make(map[string]map[string]aggState, len(states))
 	for key, byWindow := range states {
 		wm := make(map[string]aggState, len(byWindow))
-		for w, agg := range byWindow {
-			wm[windowKey(w)] = aggState{Kind: agg.snapshotKind(), Value: agg.Result()}
+		for w, cell := range byWindow {
+			wm[windowKey(w)] = aggState{Kind: cell.agg.snapshotKind(), Value: cell.agg.Result(), Fired: cell.fired}
 		}
 		out[key] = wm
 	}

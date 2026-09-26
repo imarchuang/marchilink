@@ -24,9 +24,12 @@ func main() {
 		wmBound     = flag.Duration("watermark-bound", 2*time.Second, "bounded out-of-orderness for watermarks")
 		windowSize  = flag.Duration("window", 5*time.Second, "window size")
 		windowSlide = flag.Duration("slide", 0, "window slide (0 = tumbling)")
+		sessionGap  = flag.Duration("session", 0, "session window gap (overrides -window/-slide when > 0)")
+		lateness    = flag.Duration("lateness", 0, "allowed lateness for windows (0 = drop late records)")
 		httpAddr    = flag.String("http", ":9081", "HTTP observability address")
-		dataDir     = flag.String("data-dir", "", "checkpoint data directory (empty = no checkpointing)")
-		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = disabled)")
+		dataDir     = flag.String("data-dir", "", "state backend directory (empty = no checkpoints/savepoints)")
+		chkEvery    = flag.Duration("checkpoint", 0, "checkpoint interval (0 = savepoints only)")
+		resumeFrom  = flag.String("resume", "", "resume from named savepoint under {data-dir}/savepoints")
 	)
 	flag.Parse()
 
@@ -62,8 +65,11 @@ func main() {
 		WatermarkBound(*wmBound).
 		Sink(runtime.StdoutSink{Writer: os.Stdout})
 
-	if *dataDir != "" && *chkEvery > 0 {
+	if *dataDir != "" {
 		job.Checkpointing(*dataDir, *chkEvery)
+	}
+	if *resumeFrom != "" {
+		job.ResumeFrom(*resumeFrom)
 	}
 
 	switch *jobName {
@@ -73,16 +79,28 @@ func main() {
 		job.Process(runningCount)
 	default: // windowed-count
 		var assigner runtime.WindowAssigner
-		if *windowSlide > 0 {
+		switch {
+		case *sessionGap > 0:
+			assigner = runtime.Session(*sessionGap)
+		case *windowSlide > 0:
 			assigner = runtime.Sliding(*windowSize, *windowSlide)
-		} else {
+		default:
 			assigner = runtime.Tumbling(*windowSize)
 		}
 		job.Window(assigner, runtime.Count())
+		if *lateness > 0 {
+			job.AllowedLateness(*lateness)
+			job.SideOutput(runtime.SinkFunc(func(_ context.Context, e runtime.Event) error {
+				_, err := fmt.Fprintf(os.Stdout, "%s LATE key=%s value=%s\n",
+					e.Timestamp.Format("15:04:05.000"), e.Key, e.Value)
+				return err
+			}))
+		}
 	}
 
 	graph := job.Graph()
-	server := &http.Server{Addr: *httpAddr, Handler: runtime.HTTPServer{Graph: graph}.Handler()}
+	observer := &runtime.HTTPServer{Graph: graph}
+	server := &http.Server{Addr: *httpAddr, Handler: observer.Handler()}
 
 	go func() {
 		<-ctx.Done()

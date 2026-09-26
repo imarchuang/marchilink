@@ -44,6 +44,9 @@ type subtaskSnapshot struct {
 type aggState struct {
 	Kind  string `json:"kind"`  // "count" or "sum"
 	Value string `json:"value"` // serialized result
+	// Fired records whether the window already fired; fired cells are kept
+	// until the allowed lateness expires so late records can re-fire.
+	Fired bool `json:"fired,omitempty"`
 }
 
 // windowKey encodes a Window as a map key.
@@ -66,6 +69,12 @@ type checkpointStore struct {
 
 func newCheckpointStore(dataDir, jobID string) *checkpointStore {
 	return &checkpointStore{dir: filepath.Join(dataDir, "checkpoints", jobID)}
+}
+
+// newSavepointStore persists savepoints under {dataDir}/savepoints/{name}.
+// Same layout as checkpoints, but triggered manually and never auto-deleted.
+func newSavepointStore(dataDir, name string) *checkpointStore {
+	return &checkpointStore{dir: filepath.Join(dataDir, "savepoints", name)}
 }
 
 func (s *checkpointStore) chkDir(id checkpointID) string {

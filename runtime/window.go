@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -72,6 +73,42 @@ func (a slidingAssigner) Assign(ts time.Time) []Window {
 	return windows
 }
 
+// Session returns a session window assigner: each event opens a window
+// [ts, ts+gap), and windows that touch or overlap merge into one. A session
+// closes when no event arrives for gap — i.e. it fires when the watermark
+// passes last-event-ts + gap.
+func Session(gap time.Duration) WindowAssigner {
+	return sessionAssigner{gap: gap}
+}
+
+type sessionAssigner struct {
+	gap time.Duration
+}
+
+func (a sessionAssigner) Assign(ts time.Time) []Window {
+	if a.gap <= 0 {
+		return nil
+	}
+	return []Window{{Start: ts.UTC(), End: ts.Add(a.gap).UTC()}}
+}
+
+// Merges marks session windows as merging: the window operator unions
+// overlapping windows per key instead of keeping them separate.
+func (a sessionAssigner) Merges() bool { return true }
+
+// mergingAssigner is implemented by assigners whose windows merge on contact
+// (session windows). The window operator type-asserts for it.
+type mergingAssigner interface {
+	Merges() bool
+}
+
+// windowsMerge reports whether two windows merge into one session. Like
+// Flink's TimeWindow.intersects the comparison is inclusive: an event
+// arriving exactly gap after another still extends the session.
+func windowsMerge(a, b Window) bool {
+	return !a.Start.After(b.End) && !b.Start.After(a.End)
+}
+
 // Aggregator accumulates events inside one (key, window) state cell.
 type Aggregator interface {
 	Add(event Event)
@@ -80,6 +117,9 @@ type Aggregator interface {
 	snapshotKind() string
 	// restore sets the aggregator's value from a checkpointed Result string.
 	restore(value string) error
+	// merge folds another aggregator of the same kind into this one.
+	// Needed by merging (session) windows.
+	merge(other Aggregator) error
 }
 
 // AggFactory creates a fresh Aggregator per (key, window).
@@ -106,6 +146,15 @@ func (a *countAggregator) restore(value string) error {
 		return err
 	}
 	a.n = n
+	return nil
+}
+
+func (a *countAggregator) merge(other Aggregator) error {
+	o, ok := other.(*countAggregator)
+	if !ok {
+		return fmt.Errorf("cannot merge %T into countAggregator", other)
+	}
+	a.n += o.n
 	return nil
 }
 
@@ -137,5 +186,14 @@ func (a *sumAggregator) restore(value string) error {
 		return err
 	}
 	a.v = f
+	return nil
+}
+
+func (a *sumAggregator) merge(other Aggregator) error {
+	o, ok := other.(*sumAggregator)
+	if !ok {
+		return fmt.Errorf("cannot merge %T into sumAggregator", other)
+	}
+	a.v += o.v
 	return nil
 }
